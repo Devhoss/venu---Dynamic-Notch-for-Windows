@@ -9,6 +9,7 @@
 //! * [`geom`]    — the silhouette and its path
 //! * [`hook`]    — the wheel hook, parked on its own thread
 //! * [`media`]   — the Now Playing poller, on its own thread
+//! * [`volume`]  — Core Audio output volume, read on the media poll cycle
 //! * [`theme`]   — colour and type tokens
 //! * [`text`]    — DirectWrite, including the bundled private fonts
 //! * [`surface`] — the Direct2D target behind the layered window
@@ -26,6 +27,7 @@ pub mod state;
 pub mod surface;
 pub mod text;
 pub mod theme;
+pub mod volume;
 pub mod window;
 
 use std::sync::Arc;

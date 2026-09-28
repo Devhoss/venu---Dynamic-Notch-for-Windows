@@ -264,6 +264,58 @@ pub fn media_transport_buttons(body: D2D_RECT_F) -> [(f32, f32, f32); 3] {
     ]
 }
 
+/// Speaker button for the Now Playing volume control — present at all times,
+/// level permitting. Clicking it toggles mute and nothing else. Sits on the
+/// same baseline as the transport row, outboard of the next button, and is
+/// sized like one so the row reads as a unit.
+///
+/// Returns `None` when there is no usable output device, so the painter and the
+/// hit-test agree on hiding the whole control.
+pub fn volume_speaker(body: D2D_RECT_F, available: bool) -> Option<(f32, f32, f32)> {
+    if !available {
+        return None;
+    }
+    let [_, _, next] = media_transport_buttons(body);
+    let r = 11.0;
+    Some((next.0 + 42.0, next.1, r))
+}
+
+/// The volume track, drawn to the right of the speaker and always present. The
+/// slide has the width for it — the transport row spans ~68px of a ~708px body
+/// — so there is nothing to gain from hiding it behind a click.
+pub fn volume_track(body: D2D_RECT_F) -> D2D_RECT_F {
+    let Some((sx, sy, _)) = volume_speaker(body, true) else {
+        return D2D_RECT_F {
+            left: body.right,
+            top: body.bottom,
+            right: body.right,
+            bottom: body.bottom,
+        };
+    };
+    let w = 96.0;
+    let h = 4.0;
+    D2D_RECT_F {
+        left: sx + 18.0,
+        top: sy - h * 0.5,
+        right: sx + 18.0 + w,
+        bottom: sy + h * 0.5,
+    }
+}
+
+/// Map a horizontal point to a level in `0.0..=1.0`. The inverse of how
+/// [`volume_track`] is filled, shared by the painter and the hit-test so the
+/// handle lands exactly under the cursor.
+///
+/// The vertical band is deliberately ignored: a slider that demands the pointer
+/// stay on a 4 px line is a slider users miss.
+pub fn volume_from_x(track: D2D_RECT_F, x: f32) -> f32 {
+    let width = track.right - track.left;
+    if width <= 0.0 {
+        return 0.0;
+    }
+    super::volume::clamp((x - track.left) / width)
+}
+
 /// "Clear All" button bounds in the Notifications slide header.
 pub fn notification_clear_button(body: D2D_RECT_F) -> D2D_RECT_F {
     D2D_RECT_F {
@@ -304,5 +356,60 @@ pub fn notification_dismiss_button(body: D2D_RECT_F) -> D2D_RECT_F {
         top: body.bottom - 22.0,
         right: body.right,
         bottom: body.bottom + 2.0,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn track_at(left: f32, right: f32) -> D2D_RECT_F {
+        D2D_RECT_F {
+            left,
+            top: 0.0,
+            right,
+            bottom: 4.0,
+        }
+    }
+
+    #[test]
+    fn a_point_at_the_ends_of_the_track_maps_to_the_level_bounds() {
+        let track = track_at(100.0, 200.0);
+        assert_eq!(volume_from_x(track, 100.0), 0.0);
+        assert_eq!(volume_from_x(track, 200.0), 1.0);
+    }
+
+    #[test]
+    fn the_middle_of_the_track_is_the_middle_level() {
+        let track = track_at(100.0, 200.0);
+        assert_eq!(volume_from_x(track, 150.0), 0.5);
+    }
+
+    #[test]
+    fn dragging_past_either_end_clamps_rather_than_wrapping() {
+        // The important one: a drag that runs off the end must not wrap around
+        // to full volume in the other direction.
+        let track = track_at(100.0, 200.0);
+        assert_eq!(volume_from_x(track, 0.0), 0.0);
+        assert_eq!(volume_from_x(track, -500.0), 0.0);
+        assert_eq!(volume_from_x(track, 999.0), 1.0);
+    }
+
+    #[test]
+    fn a_degenerate_track_reports_silence_rather_than_dividing_by_zero() {
+        let track = track_at(100.0, 100.0);
+        assert_eq!(volume_from_x(track, 100.0), 0.0);
+    }
+
+    #[test]
+    fn the_speaker_is_hidden_when_there_is_no_output_device() {
+        let body = D2D_RECT_F {
+            left: 0.0,
+            top: 0.0,
+            right: 708.0,
+            bottom: 159.0,
+        };
+        assert!(volume_speaker(body, false).is_none());
+        assert!(volume_speaker(body, true).is_some());
     }
 }
