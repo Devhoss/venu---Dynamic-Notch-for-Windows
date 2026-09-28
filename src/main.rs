@@ -223,8 +223,16 @@ fn main() {
         .with_title("Venu - Settings")
         .with_inner_size([760.0, 600.0])
         .with_min_inner_size([620.0, 480.0])
-        .with_visible(!quiet)
-        .with_active(!quiet);
+        .with_visible(true)
+        .with_active(true);
+
+    if quiet {
+        // Going to the tray is expressed by parking the window one pixel
+        // off-screen, not by creating it hidden: a hidden eframe window leaves
+        // the event loop busy-waiting for a redraw that never comes, which
+        // pins a core. See `gui::park_window`.
+        viewport_builder = gui::parked_viewport(viewport_builder);
+    }
 
     if let Some(icon) = create_app_icon_data() {
         viewport_builder = viewport_builder.with_icon(icon);

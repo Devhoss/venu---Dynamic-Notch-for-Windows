@@ -167,6 +167,27 @@ pub fn restore_settings_window() {
     }
 }
 
+/// Ask for the Settings window without touching it from the calling thread.
+///
+/// The notch's Settings button is clicked from inside `window.tick`, which runs
+/// while the overlay thread holds the config write lock. The foreground calls
+/// in [`restore_settings_window`] are synchronous cross-thread messages: the
+/// Settings thread has to answer them, and it may be blocked waiting for that
+/// same config lock. Overlay thread waiting on Settings thread, Settings thread
+/// waiting on the lock the overlay thread holds -- a deadlock that showed up as
+/// a permanently "Not Responding" window.
+///
+/// So this variant only raises the flag and nudges egui. The eframe thread picks
+/// SHOW_REQUESTED up in its own `update`, where it unparks the window and does
+/// the foreground work itself, with no lock held across any Win32 call.
+pub fn request_settings_window() {
+    SHOW_REQUESTED.store(true, Ordering::SeqCst);
+
+    if let Some(ctx) = crate::gui::get_egui_context() {
+        ctx.request_repaint();
+    }
+}
+
 impl SystemTray {
     pub fn new() -> windows::core::Result<Self> {
         unsafe {

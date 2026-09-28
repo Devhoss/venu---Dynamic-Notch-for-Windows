@@ -273,6 +273,120 @@ pub struct SettingsApp {
     /// Whether the window is on screen. Venu is a tray app: most of the time
     /// this is false, and a hidden window has nothing worth redrawing.
     on_screen: bool,
+    /// Where the window was before it was stashed, so putting it back returns
+    /// it to the size and position the user left it at.
+    stashed_rect: Option<windows::Win32::Foundation::RECT>,
+    /// Whether the window is currently parked off-screen. See [`park_window`].
+    parked: bool,
+}
+
+/// Where a parked window is put: far enough off every monitor that it cannot be
+/// seen, and small enough that even a stray taskbar preview is nothing.
+/// -32000 is the conventional off-screen coordinate on Windows.
+pub const PARK_POS: i32 = -32_000;
+
+/// The viewport a tray-resident Venu starts with: one pixel, off-screen, and
+/// *visible*. A hidden window is exactly the state that makes eframe's event
+/// loop busy-wait, so the quiet launch parks the window rather than hiding it,
+/// and it has to be created this way because a window created hidden never
+/// leaves that state on its own.
+pub fn parked_viewport(viewport: egui::ViewportBuilder) -> egui::ViewportBuilder {
+    viewport
+        .with_inner_size([1.0, 1.0])
+        // Without dropping the minimum, the 1x1 above is clamped back up to
+        // 620x480 by the window's track size.
+        .with_min_inner_size([1.0, 1.0])
+        .with_position(egui::pos2(PARK_POS as f32, PARK_POS as f32))
+        .with_visible(true)
+        .with_active(false)
+}
+
+/// Shrink the Settings window to a single pixel off-screen.
+///
+/// Venu does not simply hide the window when it goes to the tray. eframe and
+/// winit busy-wait for a redraw that can never arrive while a window is hidden,
+/// and on this machine that pinned a core: measured at 75-85% CPU with the
+/// main thread permanently `Running`. Keeping the window technically visible
+/// but 1x1 and off-screen leaves the event loop blocked in `Wait` instead, so
+/// the tray state is genuinely idle.
+///
+/// This goes through Win32 rather than `ViewportCommand::InnerSize` because the
+/// window has a 620x480 minimum track size that egui 0.29 cannot lower, and
+/// that would clamp any attempt to shrink it.
+///
+/// Returns the window's previous rectangle so it can be restored.
+pub fn park_window() -> Option<windows::Win32::Foundation::RECT> {
+    use windows::Win32::Foundation::HWND;
+    use windows::Win32::UI::WindowsAndMessaging::{SetWindowPos, SWP_NOACTIVATE, SWP_NOZORDER};
+    unsafe {
+        let hwnd = find_settings_hwnd()?;
+        let mut prev = windows::Win32::Foundation::RECT::default();
+        windows::Win32::UI::WindowsAndMessaging::GetWindowRect(hwnd, &mut prev).ok()?;
+        SetWindowPos(
+            hwnd,
+            HWND(std::ptr::null_mut()),
+            PARK_POS,
+            PARK_POS,
+            1,
+            1,
+            SWP_NOZORDER | SWP_NOACTIVATE,
+        )
+        .ok()?;
+        Some(prev)
+    }
+}
+
+/// Put a previously parked window back where it was, or at a sensible default
+/// centred on the monitor if the saved rectangle was lost.
+pub fn unpark_window(prev: Option<windows::Win32::Foundation::RECT>) {
+    use windows::Win32::Foundation::HWND;
+    use windows::Win32::UI::WindowsAndMessaging::{SetWindowPos, SWP_NOACTIVATE, SWP_NOZORDER};
+    unsafe {
+        let Some(hwnd) = find_settings_hwnd() else {
+            return;
+        };
+        let (x, y, w, h) = match prev {
+            Some(r) => (r.left, r.top, r.right - r.left, r.bottom - r.top),
+            None => center_on_primary(hwnd, 760, 600),
+        };
+        let _ = SetWindowPos(
+            hwnd,
+            HWND(std::ptr::null_mut()),
+            x,
+            y,
+            w,
+            h,
+            SWP_NOZORDER | SWP_NOACTIVATE,
+        );
+    }
+}
+
+/// Top-left for a `w` x `h` window centred on the monitor the given window is
+/// currently on, falling back to the primary monitor.
+unsafe fn center_on_primary(
+    hwnd: windows::Win32::Foundation::HWND,
+    w: i32,
+    h: i32,
+) -> (i32, i32, i32, i32) {
+    use windows::Win32::Graphics::Gdi::{
+        GetMonitorInfoW, MonitorFromWindow, MONITORINFO, MONITOR_DEFAULTTOPRIMARY,
+    };
+    let mut mi = MONITORINFO {
+        cbSize: std::mem::size_of::<MONITORINFO>() as u32,
+        ..Default::default()
+    };
+    let mon = MonitorFromWindow(hwnd, MONITOR_DEFAULTTOPRIMARY);
+    if GetMonitorInfoW(mon, &mut mi).as_bool() {
+        let work = mi.rcWork;
+        (
+            work.left + (work.right - work.left - w) / 2,
+            work.top + (work.bottom - work.top - h) / 2,
+            w,
+            h,
+        )
+    } else {
+        (0, 0, w, h)
+    }
 }
 
 /// A strong ease-out — the same shape as `cubic-bezier(0.23, 1, 0.32, 1)`.
@@ -338,6 +452,12 @@ impl SettingsApp {
             palette: None,
             preview: wallpaper::PreviewCache::new(),
             on_screen,
+            stashed_rect: None,
+            // A quiet launch begins already parked, so the first
+            // SHOW_REQUESTED restores it instead of treating it as a fresh
+            // window. There is no saved rect in that case, and `unpark_window`
+            // falls back to a sensible centred default.
+            parked: !on_screen,
         }
     }
 
@@ -2733,18 +2853,47 @@ impl eframe::App for SettingsApp {
         }
 
         if ctx.input(|i| i.viewport().close_requested()) {
-            // Closing puts Venu back in the tray rather than ending it.
+            // Closing puts Venu back in the tray rather than ending it. The
+            // window is parked rather than hidden: see `park_window` for why a
+            // hidden eframe window busy-waits a core on this machine.
             ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
-            ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
+            if !self.parked {
+                self.stashed_rect = park_window();
+                self.parked = true;
+            }
             self.on_screen = false;
         }
 
         if crate::tray::SHOW_REQUESTED.swap(false, std::sync::atomic::Ordering::SeqCst) {
+            if self.parked {
+                unpark_window(self.stashed_rect.take());
+                self.parked = false;
+            }
             ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
             ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
             ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
             self.on_screen = true;
             ctx.request_repaint();
+
+            // Raise the window from this thread. The notch's Settings button
+            // used to do this itself, but it runs on the overlay thread while
+            // that thread holds the config write lock, and the foreground
+            // calls are synchronous: the Settings thread would have to answer
+            // them while blocked on the very same lock. Doing the work here,
+            // before the lock is taken, keeps that from deadlocking.
+            unsafe {
+                use windows::Win32::UI::WindowsAndMessaging::{
+                    AllowSetForegroundWindow, BringWindowToTop, SetForegroundWindow, ShowWindow,
+                    SW_RESTORE, SW_SHOW,
+                };
+                let _ = AllowSetForegroundWindow(std::process::id());
+                if let Some(hwnd) = find_settings_hwnd() {
+                    let _ = ShowWindow(hwnd, SW_SHOW);
+                    let _ = ShowWindow(hwnd, SW_RESTORE);
+                    let _ = BringWindowToTop(hwnd);
+                    let _ = SetForegroundWindow(hwnd);
+                }
+            }
         }
 
         let mut config_changed = false;

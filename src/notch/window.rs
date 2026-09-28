@@ -836,11 +836,14 @@ impl NotchWindow {
             return;
         }
 
-        // Settings launcher button: opens the Settings panel
+        // Settings launcher button: opens the Settings panel.
+        // This runs on the overlay thread while it holds the config write lock,
+        // so it must not make synchronous Win32 calls into the Settings
+        // window -- see `tray::request_settings_window`.
         let (sx, sy, sr) = shape.settings_button();
         let hit_s = sr + 5.0;
         if (cx - sx) * (cx - sx) + (cy - sy) * (cy - sy) <= hit_s * hit_s {
-            crate::tray::restore_settings_window();
+            crate::tray::request_settings_window();
             return;
         }
 
