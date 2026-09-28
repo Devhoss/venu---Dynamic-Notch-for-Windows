@@ -155,6 +155,11 @@ struct PageCtx<'a> {
     changed: &'a mut bool,
     temp_text: &'a mut String,
     preview: &'a mut wallpaper::PreviewCache,
+    /// Text typed into the "add application" box, and the reason the last
+    /// attempt was refused. Live here rather than in a local so the field
+    /// keeps its contents across frames and a rejected entry stays put.
+    new_app_name: &'a mut String,
+    new_app_error: &'a mut Option<String>,
 }
 
 /// The rail, top to bottom. Order here is order on screen.
@@ -275,6 +280,12 @@ pub struct SettingsApp {
     /// Whether the window is on screen. Venu is a tray app: most of the time
     /// this is false, and a hidden window has nothing worth redrawing.
     on_screen: bool,
+    /// Text typed into the "add application" box. Lives on the app rather than
+    /// in a page function's local so the field keeps its contents between
+    /// frames and a rejected entry stays put for another try.
+    new_app_name: String,
+    /// Why the last add attempt was refused, shown under the input.
+    new_app_error: Option<String>,
 }
 
 /// A strong ease-out — the same shape as `cubic-bezier(0.23, 1, 0.32, 1)`.
@@ -340,6 +351,8 @@ impl SettingsApp {
             palette: None,
             preview: wallpaper::PreviewCache::new(),
             on_screen,
+            new_app_name: String::new(),
+            new_app_error: None,
         }
     }
 
@@ -556,7 +569,7 @@ impl SettingsApp {
     }
 
     fn page_notch_notifications(ui: &mut egui::Ui, cx: &mut PageCtx<'_>) {
-        Self::sec_notch_notifications(ui, cx.cfg, cx.changed);
+        Self::sec_notch_notifications(ui, cx);
     }
 
     fn page_edge_overview(ui: &mut egui::Ui, cx: &mut PageCtx<'_>) {
@@ -1896,7 +1909,70 @@ impl SettingsApp {
         );
     }
 
-    fn sec_notch_notifications(ui: &mut egui::Ui, cfg: &mut AppConfig, changed: &mut bool) {
+    /// The "add application" row: a name box and an Add button.
+    ///
+    /// Rejections are explained rather than swallowed, because the registry
+    /// silently ignores an invalid or duplicate name otherwise and the user
+    /// would have no idea why nothing happened.
+    fn app_add_field(
+        ui: &mut egui::Ui,
+        cfg: &mut AppConfig,
+        changed: &mut bool,
+        name_field: &mut String,
+        error: &mut Option<String>,
+    ) {
+        ui.horizontal(|ui| {
+            let response = ui.add(
+                egui::TextEdit::singleline(name_field)
+                    .hint_text("Application name")
+                    .desired_width(180.0),
+            );
+
+            // Enter submits, so the common case needs no mouse.
+            let submitted = response.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+
+            if ui.button("Add").clicked() || submitted {
+                if name_field.trim().is_empty() {
+                    *error = Some("Enter an application name.".to_string());
+                } else if cfg.notch.notifications.add_app(&*name_field) {
+                    // The webhook keeps its own copy of the allowlist, so it
+                    // has to learn about the new app immediately.
+                    crate::notch::notify::update_server_allowed_apps(
+                        cfg.notch.notifications.allowed_apps.clone(),
+                    );
+                    name_field.clear();
+                    *error = None;
+                    *changed = true;
+                } else {
+                    *error = Some(match name_field.trim().len() {
+                        0 => "Enter an application name.".to_string(),
+                        n if n > crate::config::NotificationConfig::MAX_APP_NAME_LEN => {
+                            format!(
+                                "Name is too long (max {} characters).",
+                                crate::config::NotificationConfig::MAX_APP_NAME_LEN
+                            )
+                        }
+                        _ => "That application is already in the list.".to_string(),
+                    });
+                }
+            }
+        });
+
+        if let Some(error) = &*error {
+            ui.label(
+                RichText::new(error)
+                    .size(11.0)
+                    .color(theme::text_secondary()),
+            );
+        }
+    }
+
+    fn sec_notch_notifications(ui: &mut egui::Ui, cx: &mut PageCtx<'_>) {
+        // Reborrow rather than move, so `cx` stays usable for the add field
+        // further down.
+        let cfg: &mut AppConfig = cx.cfg;
+        let changed: &mut bool = cx.changed;
+
         Self::section_title(ui, "DYNAMIC NOTIFICATIONS");
 
         if ui
@@ -1929,37 +2005,16 @@ impl SettingsApp {
         );
         ui.add_space(8.0);
 
-        let presets = [
-            "Antigravity",
-            "Codex",
-            "Claude",
-            "Cursor",
-            "Terminal",
-            "VS Code",
-            "Slack",
-            "Discord",
-        ];
+        Self::app_add_field(ui, cfg, changed, cx.new_app_name, cx.new_app_error);
 
+        ui.add_space(8.0);
+
+        let registry = cfg.notch.notifications.app_registry();
         ui.horizontal_wrapped(|ui| {
-            for preset in presets {
-                let is_allowed = cfg
-                    .notch
-                    .notifications
-                    .allowed_apps
-                    .iter()
-                    .any(|a| a.eq_ignore_ascii_case(preset));
-                if ui.selectable_label(is_allowed, preset).clicked() {
-                    if is_allowed {
-                        cfg.notch
-                            .notifications
-                            .allowed_apps
-                            .retain(|a| !a.eq_ignore_ascii_case(preset));
-                    } else {
-                        cfg.notch
-                            .notifications
-                            .allowed_apps
-                            .push(preset.to_string());
-                    }
+            for app in &registry {
+                let is_allowed = cfg.notch.notifications.is_app_allowed(app);
+                if ui.selectable_label(is_allowed, app).clicked() {
+                    cfg.notch.notifications.set_app_allowed(app, !is_allowed);
                     crate::notch::notify::update_server_allowed_apps(
                         cfg.notch.notifications.allowed_apps.clone(),
                     );
@@ -1967,6 +2022,14 @@ impl SettingsApp {
                 }
             }
         });
+
+        if registry.is_empty() {
+            ui.label(
+                RichText::new("No applications yet. Add one above to start receiving alerts.")
+                    .size(11.0)
+                    .color(theme::text_tertiary()),
+            );
+        }
 
         ui.add_space(10.0);
         ui.label(
@@ -2038,29 +2101,58 @@ impl SettingsApp {
         );
         ui.add_space(6.0);
 
-        let app_list = [
-            "Antigravity",
-            "Codex",
-            "Claude",
-            "Cursor",
-            "Terminal",
-            "VS Code",
-            "Slack",
-            "Discord",
-        ];
-        for app in app_list {
+        let registry = cfg.notch.notifications.app_registry();
+        for app in &registry {
             let mut current_color = cfg.notch.notifications.get_app_color(app);
+            let is_allowed = cfg.notch.notifications.is_app_allowed(app);
+            let mut enabled = is_allowed;
+
             ui.horizontal(|ui| {
                 ui.label(RichText::new(app).size(13.0).color(theme::text_primary()));
+
+                if ui
+                    .checkbox(&mut enabled, "")
+                    .on_hover_text("Allow this app to raise notification toasts")
+                    .changed()
+                {
+                    cfg.notch.notifications.set_app_allowed(app, enabled);
+                    crate::notch::notify::update_server_allowed_apps(
+                        cfg.notch.notifications.allowed_apps.clone(),
+                    );
+                    *changed = true;
+                }
+
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if ui
+                        .button("✕")
+                        .on_hover_text("Remove this application")
+                        .clicked()
+                    {
+                        cfg.notch.notifications.remove_app(app);
+                        crate::notch::notify::update_server_allowed_apps(
+                            cfg.notch.notifications.allowed_apps.clone(),
+                        );
+                        *changed = true;
+                    }
+
                     if ui
                         .color_edit_button_rgba_unmultiplied(&mut current_color)
                         .changed()
                     {
+                        // Preserve the casing the user chose rather than
+                        // writing whatever key happened to match.
+                        let key = cfg
+                            .notch
+                            .notifications
+                            .app_colors
+                            .keys()
+                            .find(|k| k.eq_ignore_ascii_case(app))
+                            .cloned()
+                            .unwrap_or_else(|| app.clone());
                         cfg.notch
                             .notifications
                             .app_colors
-                            .insert(app.to_string(), current_color);
+                            .insert(key, current_color);
                         *changed = true;
                     }
                 });
@@ -2932,6 +3024,8 @@ impl eframe::App for SettingsApp {
                             changed: &mut config_changed,
                             temp_text: &mut self.temp_text,
                             preview: &mut self.preview,
+                            new_app_name: &mut self.new_app_name,
+                            new_app_error: &mut self.new_app_error,
                         };
                         (page.draw)(ui, &mut cx);
                     });

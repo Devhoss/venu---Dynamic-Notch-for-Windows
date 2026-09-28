@@ -342,6 +342,131 @@ impl Default for NotificationConfig {
 }
 
 impl NotificationConfig {
+    /// Colour handed to an application that has never had one picked for it.
+    /// Matches the `Info` badge colour, so an unconfigured app looks the same
+    /// as it always has rather than picking up a new identity here.
+    pub const DEFAULT_APP_COLOR: [f32; 4] = [0.22, 0.74, 0.97, 1.0];
+
+    /// Longest application name the registry will store. Long enough for any
+    /// real product name, short enough that a hostile webhook cannot bloat
+    /// the config with one enormous key.
+    pub const MAX_APP_NAME_LEN: usize = 64;
+
+    /// Every application this config knows about, as the union of the
+    /// notification allowlist and the colour map.
+    ///
+    /// Either list can hold a name the other does not: an app may be allowed
+    /// but uncoloured, or coloured but not allowed. Both belong in Settings,
+    /// so both are surfaced. Order is stable -- allowlisted apps first, then
+    /// colour-only apps -- and each is deduped case-insensitively.
+    pub fn app_registry(&self) -> Vec<String> {
+        let mut seen: Vec<String> = Vec::new();
+
+        for name in self.allowed_apps.iter().chain(self.app_colors.keys()) {
+            if !seen
+                .iter()
+                .any(|existing| existing.eq_ignore_ascii_case(name))
+            {
+                seen.push(name.clone());
+            }
+        }
+
+        seen
+    }
+
+    /// Whether this app may raise a notification toast. An empty allowlist
+    /// means "everything", which is the long-standing behaviour and stays.
+    pub fn is_app_allowed(&self, app: &str) -> bool {
+        self.allowed_apps.is_empty()
+            || self
+                .allowed_apps
+                .iter()
+                .any(|a| a.eq_ignore_ascii_case(app))
+    }
+
+    /// Clean up user input and reject names that cannot be stored.
+    ///
+    /// Returns the name trimmed to its canonical form, or `None` when it is
+    /// empty, whitespace-only, or longer than [`Self::MAX_APP_NAME_LEN`].
+    /// Display casing is preserved; only surrounding whitespace goes.
+    pub fn normalize_app_name(input: &str) -> Option<String> {
+        let name = input.trim();
+        if name.is_empty() || name.len() > Self::MAX_APP_NAME_LEN {
+            return None;
+        }
+        Some(name.to_string())
+    }
+
+    /// Register a new application: allowed to notify, with a default colour.
+    ///
+    /// Returns `false` when the name is invalid or already registered in any
+    /// casing, so the caller can report the rejection rather than silently
+    /// adding a near-duplicate. The colour is written eagerly because the
+    /// picker needs something to edit and store.
+    pub fn add_app(&mut self, input: &str) -> bool {
+        let Some(name) = Self::normalize_app_name(input) else {
+            return false;
+        };
+
+        let already_known = self
+            .allowed_apps
+            .iter()
+            .chain(self.app_colors.keys())
+            .any(|existing| existing.eq_ignore_ascii_case(&name));
+        if already_known {
+            return false;
+        }
+
+        self.allowed_apps.push(name.clone());
+        self.app_colors.insert(name, Self::DEFAULT_APP_COLOR);
+        true
+    }
+
+    /// Drop an application from both lists. Either list may be the only place
+    /// it appears, so both are cleared regardless.
+    pub fn remove_app(&mut self, app: &str) -> bool {
+        let before = self.allowed_apps.len() + self.app_colors.len();
+
+        self.allowed_apps
+            .retain(|existing| !existing.eq_ignore_ascii_case(app));
+
+        self.app_colors
+            .retain(|existing, _| !existing.eq_ignore_ascii_case(app));
+
+        before != self.allowed_apps.len() + self.app_colors.len()
+    }
+
+    /// Allow or disallow an application, leaving its colour alone.
+    ///
+    /// Disallowing keeps the name in the registry -- it just stops toasting --
+    /// so the user can switch it back on without re-adding it.
+    pub fn set_app_allowed(&mut self, app: &str, allowed: bool) {
+        let present = self
+            .allowed_apps
+            .iter()
+            .any(|existing| existing.eq_ignore_ascii_case(app));
+
+        match (allowed, present) {
+            (true, false) => self.allowed_apps.push(app.trim().to_string()),
+            (false, true) => self
+                .allowed_apps
+                .retain(|existing| !existing.eq_ignore_ascii_case(app)),
+            // An empty allowlist is the long-standing "everything is allowed"
+            // shorthand, so there is no entry to remove. Turning one app off
+            // then has to become explicit: name every other app first, or the
+            // toggle would read as doing nothing.
+            (false, false) if self.allowed_apps.is_empty() => {
+                let others: Vec<String> = self
+                    .app_registry()
+                    .into_iter()
+                    .filter(|name| !name.eq_ignore_ascii_case(app))
+                    .collect();
+                self.allowed_apps = others;
+            }
+            _ => {}
+        }
+    }
+
     pub fn get_app_color(&self, app: &str) -> [f32; 4] {
         if let Some(c) = self.app_colors.get(app) {
             return *c;
@@ -351,17 +476,7 @@ impl NotificationConfig {
                 return *v;
             }
         }
-        match app.to_lowercase().as_str() {
-            "antigravity" => [0.0, 0.94, 1.0, 1.0],
-            "codex" => [0.06, 0.72, 0.51, 1.0],
-            "claude" => [0.98, 0.45, 0.09, 1.0],
-            "cursor" => [0.39, 0.40, 0.95, 1.0],
-            "terminal" => [0.66, 0.33, 0.97, 1.0],
-            "vs code" | "vscode" => [0.0, 0.47, 0.83, 1.0],
-            "slack" => [0.88, 0.12, 0.35, 1.0],
-            "discord" => [0.35, 0.40, 0.95, 1.0],
-            _ => [0.22, 0.74, 0.97, 1.0],
-        }
+        Self::DEFAULT_APP_COLOR
     }
 }
 
@@ -1015,5 +1130,226 @@ impl AppConfig {
         if let Ok(content) = serde_json::to_string_pretty(self) {
             let _ = fs::write(path, content);
         }
+    }
+}
+
+#[cfg(test)]
+mod notification_registry_tests {
+    use super::*;
+
+    fn has(cfg: &NotificationConfig, name: &str) -> bool {
+        cfg.app_registry()
+            .iter()
+            .any(|a| a.eq_ignore_ascii_case(name))
+    }
+
+    #[test]
+    fn registry_unions_allowlist_and_colors() {
+        let mut cfg = NotificationConfig::default();
+        // A colour-only app: not allowed, but should still be visible.
+        cfg.app_colors
+            .insert("ColorOnly".to_string(), [1.0, 0.0, 0.0, 1.0]);
+        // An allowlist-only app: allowed, never coloured.
+        cfg.allowed_apps.push("AllowOnly".to_string());
+
+        let names = cfg.app_registry();
+
+        assert!(names.contains(&"ColorOnly".to_string()));
+        assert!(names.contains(&"AllowOnly".to_string()));
+        for preset in ["Antigravity", "Codex", "Claude", "Discord"] {
+            assert!(
+                has(&cfg, preset),
+                "default app {preset} missing from registry"
+            );
+        }
+    }
+
+    #[test]
+    fn add_app_registers_in_both_lists() {
+        let mut cfg = NotificationConfig::default();
+        assert!(cfg.add_app("Hermes"));
+
+        assert!(cfg.allowed_apps.iter().any(|a| a == "Hermes"));
+        assert!(cfg
+            .app_colors
+            .get("Hermes")
+            .copied()
+            .is_some_and(|c| c == NotificationConfig::DEFAULT_APP_COLOR));
+        assert!(cfg.is_app_allowed("Hermes"));
+    }
+
+    #[test]
+    fn add_app_rejects_duplicates_and_bad_input() {
+        let mut cfg = NotificationConfig::default();
+        assert!(cfg.add_app("Hermes"));
+
+        // Same app, different casing, must not be added twice.
+        assert!(!cfg.add_app("hermes"));
+        assert!(!cfg.add_app("HERMES"));
+        assert_eq!(
+            cfg.allowed_apps
+                .iter()
+                .filter(|a| a.eq_ignore_ascii_case("Hermes"))
+                .count(),
+            1
+        );
+
+        // Names that cannot be stored.
+        assert!(!cfg.add_app(""));
+        assert!(!cfg.add_app("   "));
+        assert!(!cfg.add_app(&"x".repeat(NotificationConfig::MAX_APP_NAME_LEN + 1)));
+
+        // An existing default app is a duplicate, not a new entry.
+        assert!(!cfg.add_app("discord"));
+    }
+
+    #[test]
+    fn add_app_preserves_display_casing() {
+        let mut cfg = NotificationConfig::default();
+        assert!(cfg.add_app("  OpenClaw  "));
+        assert!(cfg.allowed_apps.iter().any(|a| a == "OpenClaw"));
+    }
+
+    #[test]
+    fn remove_app_clears_both_lists() {
+        let mut cfg = NotificationConfig::default();
+        cfg.add_app("Hermes");
+        assert!(cfg.remove_app("hermes"));
+
+        assert!(!cfg.allowed_apps.iter().any(|a| a == "Hermes"));
+        assert!(!cfg.app_colors.contains_key("Hermes"));
+        assert!(!has(&cfg, "Hermes"));
+
+        // Built-ins survive the removal.
+        assert!(has(&cfg, "Claude"));
+        // Removing something absent is a no-op, not a silent success.
+        assert!(!cfg.remove_app("NeverExisted"));
+    }
+
+    #[test]
+    fn toggling_permission_keeps_the_app_registered() {
+        let mut cfg = NotificationConfig::default();
+        cfg.add_app("Hermes");
+
+        cfg.set_app_allowed("Hermes", false);
+        assert!(!cfg.is_app_allowed("Hermes"));
+        // Still known, so it can be switched back on without re-adding.
+        assert!(has(&cfg, "Hermes"));
+        assert!(cfg.app_colors.contains_key("Hermes"));
+
+        cfg.set_app_allowed("Hermes", true);
+        assert!(cfg.is_app_allowed("Hermes"));
+    }
+
+    #[test]
+    fn empty_allowlist_still_means_everything() {
+        let cfg = NotificationConfig::default();
+        assert!(cfg.is_app_allowed("Antigravity"));
+
+        let mut open = NotificationConfig::default();
+        open.allowed_apps.clear();
+        assert!(open.is_app_allowed("AnythingAtAll"));
+    }
+
+    #[test]
+    fn disabling_from_wildcard_allowlist_becomes_explicit() {
+        // An empty allowlist means "all allowed", so there is no entry to
+        // remove. The toggle still has to take effect, which means naming
+        // every other app instead of silently doing nothing.
+        let mut cfg = NotificationConfig::default();
+        cfg.allowed_apps.clear();
+        assert!(cfg.is_app_allowed("Claude"));
+
+        cfg.set_app_allowed("Claude", false);
+
+        assert!(!cfg.is_app_allowed("Claude"));
+        assert!(
+            cfg.is_app_allowed("Codex"),
+            "other apps should stay allowed"
+        );
+        // The app is still registered, so it can be switched back on.
+        assert!(has(&cfg, "Claude"));
+    }
+
+    #[test]
+    fn uncoloured_allowed_app_falls_back_and_is_editable() {
+        let mut cfg = NotificationConfig::default();
+        cfg.add_app("Hermes");
+        // Simulate a config written before this app had a colour.
+        cfg.app_colors.remove("Hermes");
+
+        let fallback = cfg.get_app_color("Hermes");
+        assert_eq!(fallback, NotificationConfig::DEFAULT_APP_COLOR);
+        assert!(has(&cfg, "Hermes"));
+
+        // And the fallback is storable, which is what the picker needs.
+        cfg.app_colors
+            .insert("Hermes".to_string(), [0.5, 0.1, 0.9, 1.0]);
+        assert_eq!(cfg.get_app_color("Hermes"), [0.5, 0.1, 0.9, 1.0]);
+    }
+
+    #[test]
+    fn legacy_config_without_new_fields_still_loads() {
+        // A config.json written before the registry existed: the two fields
+        // the registry is built from, and nothing else.
+        let legacy = r#"{
+            "enabled": true,
+            "allowed_apps": ["Claude", "Custom App"],
+            "toast_duration_secs": 4.5,
+            "webhook_port": 18923,
+            "sound_enabled": true,
+            "glow_style": "CountdownDrain",
+            "app_colors": {"Custom App": [0.1, 0.2, 0.3, 1.0]}
+        }"#;
+
+        let cfg: NotificationConfig = serde_json::from_str(legacy).expect("legacy config parses");
+
+        assert!(cfg.is_app_allowed("Custom App"));
+        assert_eq!(cfg.get_app_color("Custom App"), [0.1, 0.2, 0.3, 1.0]);
+        // Present in the allowlist but never coloured -> fallback, still listed.
+        assert!(has(&cfg, "Claude"));
+        assert_eq!(
+            cfg.get_app_color("Claude"),
+            NotificationConfig::DEFAULT_APP_COLOR
+        );
+    }
+
+    #[test]
+    fn every_default_app_still_has_its_own_colour() {
+        // The hard-coded colour match was removed on the strength of this:
+        // the seeded map must cover every built-in.
+        let cfg = NotificationConfig::default();
+        let distinct: Vec<[f32; 4]> = cfg
+            .app_registry()
+            .iter()
+            .map(|a| cfg.get_app_color(a))
+            .collect();
+
+        for (name, color) in cfg.app_colors.iter() {
+            assert!(
+                distinct.contains(color),
+                "built-in {name} lost its colour after removing the match fallback"
+            );
+        }
+        // Built-ins are not all the same colour, i.e. the map really is used.
+        let mut unique = distinct.clone();
+        unique.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        unique.dedup();
+        assert!(unique.len() > 1);
+    }
+
+    #[test]
+    fn registry_round_trips_through_serde() {
+        let mut cfg = NotificationConfig::default();
+        cfg.add_app("Hermes");
+        cfg.app_colors
+            .insert("Hermes".to_string(), [0.9, 0.1, 0.1, 1.0]);
+
+        let text = serde_json::to_string_pretty(&cfg).unwrap();
+        let back: NotificationConfig = serde_json::from_str(&text).unwrap();
+
+        assert!(back.is_app_allowed("Hermes"));
+        assert_eq!(back.get_app_color("Hermes"), [0.9, 0.1, 0.1, 1.0]);
+        assert!(has(&back, "Hermes"));
     }
 }
