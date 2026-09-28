@@ -227,11 +227,11 @@ fn main() {
         .with_active(true);
 
     if quiet {
-        // Going to the tray is expressed by parking the window one pixel
-        // off-screen, not by creating it hidden: a hidden eframe window leaves
-        // the event loop busy-waiting for a redraw that never comes, which
-        // pins a core. See `gui::park_window`.
-        viewport_builder = gui::parked_viewport(viewport_builder);
+        // Going to the tray means creating the window hidden. eframe 0.34
+        // no longer busy-waits a core for a redraw that cannot arrive while
+        // the window is hidden, so the 1x1 off-screen parking that eframe 0.29
+        // needed is gone.
+        viewport_builder = viewport_builder.with_visible(false);
     }
 
     if let Some(icon) = create_app_icon_data() {

@@ -301,6 +301,10 @@ pub struct TickOutcome {
     /// this is false the overlay thread drops to a slow poll that watches for
     /// hover and input without drawing anything.
     pub animating: bool,
+    /// The Settings button was clicked. The overlay thread has to raise the
+    /// Settings window itself once it has dropped the config write lock -- see
+    /// `NotchManager::tick`.
+    pub open_settings: bool,
 }
 
 pub struct NotchWindow {
@@ -328,6 +332,9 @@ pub struct NotchWindow {
     last_motion: Motion,
     last_paint: Instant,
     z_asserted_at: Instant,
+    /// Set by the Settings button, consumed at the end of `tick`. See
+    /// `TickOutcome::open_settings`.
+    open_settings: bool,
 }
 
 unsafe impl Send for NotchWindow {}
@@ -404,6 +411,7 @@ impl NotchWindow {
             last_motion: Motion::Still,
             last_paint: Instant::now(),
             z_asserted_at: Instant::now(),
+            open_settings: false,
         })
     }
 
@@ -786,6 +794,7 @@ impl NotchWindow {
             // still in flight — a spring, the marquee, a countdown — and the
             // next one should not be kept waiting.
             animating: changed || self.last_motion == Motion::Continuous,
+            open_settings: std::mem::take(&mut self.open_settings),
         }
     }
 
@@ -837,13 +846,14 @@ impl NotchWindow {
         }
 
         // Settings launcher button: opens the Settings panel.
-        // This runs on the overlay thread while it holds the config write lock,
-        // so it must not make synchronous Win32 calls into the Settings
-        // window -- see `tray::request_settings_window`.
+        // Raising the window is left to the overlay thread once it has dropped
+        // the config write lock -- see `NotchManager::tick`. Doing the Win32
+        // calls here would mean holding that lock across a synchronous
+        // cross-thread message to a window whose thread wants the same lock.
         let (sx, sy, sr) = shape.settings_button();
         let hit_s = sr + 5.0;
         if (cx - sx) * (cx - sx) + (cy - sy) * (cy - sy) <= hit_s * hit_s {
-            crate::tray::request_settings_window();
+            self.open_settings = true;
             return;
         }
 
