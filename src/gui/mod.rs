@@ -162,6 +162,12 @@ struct PageCtx<'a> {
     new_app_error: &'a mut Option<String>,
     new_source_exe: &'a mut String,
     new_source_kind: &'a mut crate::config::SourceKind,
+    /// Set when a disable was refused because it would empty the allowlist.
+    ///
+    /// Lives here rather than in a local for the same reason as
+    /// `new_app_error`: a local is rebuilt every frame, so the explanation
+    /// would flash for one frame and never be readable.
+    allow_toggle_notice: &'a mut Option<String>,
 }
 
 /// The rail, top to bottom. Order here is order on screen.
@@ -294,7 +300,21 @@ pub struct SettingsApp {
     new_source_exe: String,
     /// Which kind the Add flow is currently set to register.
     new_source_kind: crate::config::SourceKind,
+    /// Set when a disable was refused because it would empty the allowlist.
+    ///
+    /// Stored on the app, not in a page local: a local is rebuilt every
+    /// frame, so the explanation would flash for one frame and never be
+    /// readable.
+    allow_toggle_notice: Option<String>,
 }
+
+/// Shown when a source cannot be disabled because it is the last one allowed.
+///
+/// An empty allowlist means "every source", so the final switch-off is
+/// refused rather than allowed to silently flip the whole registry back on.
+const ALLOWLIST_LAST_SOURCE_NOTICE: &str =
+    "An empty allowlist means \"all sources\", so at least one must stay enabled. \
+     Remove the source instead if you want it gone.";
 
 /// A strong ease-out — the same shape as `cubic-bezier(0.23, 1, 0.32, 1)`.
 ///
@@ -363,6 +383,7 @@ impl SettingsApp {
             new_app_error: None,
             new_source_exe: String::new(),
             new_source_kind: Default::default(),
+            allow_toggle_notice: None,
         }
     }
 
@@ -2098,14 +2119,26 @@ impl SettingsApp {
                 let app = &entry.name;
                 let is_allowed = entry.allowed;
                 if ui.selectable_label(is_allowed, app).clicked() {
-                    cfg.notch.notifications.set_app_allowed(app, !is_allowed);
-                    crate::notch::notify::update_server_allowed_apps(
-                        cfg.notch.notifications.allowed_apps.clone(),
-                    );
-                    *changed = true;
+                    // Turning off the only remaining source would empty the
+                    // allowlist, which means "allow everything" -- so the
+                    // refusal has to reach the user instead of leaving the
+                    // chip silently flipped back on.
+                    if cfg.notch.notifications.set_app_allowed(app, !is_allowed) {
+                        crate::notch::notify::update_server_allowed_apps(
+                            cfg.notch.notifications.allowed_apps.clone(),
+                        );
+                        *cx.allow_toggle_notice = None;
+                        *changed = true;
+                    } else {
+                        *cx.allow_toggle_notice = Some(ALLOWLIST_LAST_SOURCE_NOTICE.to_string());
+                    }
                 }
             }
         });
+
+        if let Some(notice) = &*cx.allow_toggle_notice {
+            ui.label(RichText::new(notice).size(11.0).color(theme::accent()));
+        }
 
         if registry.is_empty() {
             ui.label(
@@ -2199,11 +2232,19 @@ impl SettingsApp {
                     .on_hover_text("Allow this source to raise notification toasts")
                     .changed()
                 {
-                    cfg.notch.notifications.set_app_allowed(app, enabled);
-                    crate::notch::notify::update_server_allowed_apps(
-                        cfg.notch.notifications.allowed_apps.clone(),
-                    );
-                    *changed = true;
+                    // Same guard as the chip row: the last source cannot be
+                    // switched off, or the empty allowlist would read as
+                    // "all allowed" and switch everything back on.
+                    if cfg.notch.notifications.set_app_allowed(app, enabled) {
+                        crate::notch::notify::update_server_allowed_apps(
+                            cfg.notch.notifications.allowed_apps.clone(),
+                        );
+                        *changed = true;
+                    } else {
+                        // Snap the checkbox back and say why.
+                        enabled = entry.allowed;
+                        *cx.allow_toggle_notice = Some(ALLOWLIST_LAST_SOURCE_NOTICE.to_string());
+                    }
                 }
 
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -2248,6 +2289,10 @@ impl SettingsApp {
                 }
             }
             ui.add_space(2.0);
+        }
+
+        if let Some(notice) = &*cx.allow_toggle_notice {
+            ui.label(RichText::new(notice).size(11.0).color(theme::accent()));
         }
 
         Self::divider(ui);
@@ -3118,6 +3163,7 @@ impl eframe::App for SettingsApp {
                             new_app_error: &mut self.new_app_error,
                             new_source_exe: &mut self.new_source_exe,
                             new_source_kind: &mut self.new_source_kind,
+                            allow_toggle_notice: &mut self.allow_toggle_notice,
                         };
                         (page.draw)(ui, &mut cx);
                     });

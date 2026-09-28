@@ -566,17 +566,31 @@ impl NotificationConfig {
     ///
     /// Disallowing keeps the name in the registry -- it just stops toasting --
     /// so the user can switch it back on without re-adding it.
-    pub fn set_app_allowed(&mut self, app: &str, allowed: bool) {
+    ///
+    /// Returns `false` when the request was refused because an empty
+    /// allowlist means "everything allowed" (see [`Self::is_app_allowed`]),
+    /// so the last remaining source cannot be turned off. Callers should
+    /// surface that to the user rather than silently doing nothing.
+    pub fn set_app_allowed(&mut self, app: &str, allowed: bool) -> bool {
         let present = self
             .allowed_apps
             .iter()
             .any(|existing| existing.eq_ignore_ascii_case(app));
 
         match (allowed, present) {
-            (true, false) => self.allowed_apps.push(app.trim().to_string()),
-            (false, true) => self
-                .allowed_apps
-                .retain(|existing| !existing.eq_ignore_ascii_case(app)),
+            (true, false) => {
+                self.allowed_apps.push(app.trim().to_string());
+                true
+            }
+            // Removing the last entry would leave the allowlist empty, which
+            // reads as "allow everything" and silently re-enables every
+            // source in the registry. Refuse instead.
+            (false, true) if self.allowed_apps.len() == 1 => false,
+            (false, true) => {
+                self.allowed_apps
+                    .retain(|existing| !existing.eq_ignore_ascii_case(app));
+                true
+            }
             // An empty allowlist is the long-standing "everything is allowed"
             // shorthand, so there is no entry to remove. Turning one app off
             // then has to become explicit: name every other app first, or the
@@ -588,8 +602,9 @@ impl NotificationConfig {
                     .filter(|name| !name.eq_ignore_ascii_case(app))
                     .collect();
                 self.allowed_apps = others;
+                true
             }
-            _ => {}
+            _ => true,
         }
     }
 
@@ -1395,6 +1410,81 @@ mod notification_registry_tests {
         );
         // The app is still registered, so it can be switched back on.
         assert!(has(&cfg, "Claude"));
+    }
+
+    #[test]
+    fn the_last_allowed_source_cannot_be_turned_off() {
+        // Regression: deselecting every source in turn used to empty the
+        // allowlist, and an empty allowlist means "all allowed" -- so the
+        // whole registry silently switched itself back on.
+        let mut cfg = NotificationConfig::default();
+        cfg.allowed_apps.clear();
+        cfg.add_app("Hermes");
+
+        // Clear the wildcard back to just this one source.
+        for name in cfg.app_registry() {
+            if !name.eq_ignore_ascii_case("Hermes") {
+                cfg.set_app_allowed(&name, false);
+            }
+        }
+        assert_eq!(cfg.allowed_apps, vec!["Hermes".to_string()]);
+
+        // `set_app_allowed` reports false when it refuses the change.
+        let accepted = cfg.set_app_allowed("Hermes", false);
+
+        assert!(!accepted, "the last deselect must be refused");
+        assert_eq!(
+            cfg.allowed_apps,
+            vec!["Hermes".to_string()],
+            "the allowlist must not be emptied, or every source re-enables"
+        );
+        assert!(cfg.is_app_allowed("Hermes"), "Hermes stays enabled");
+        assert!(
+            !cfg.is_app_allowed("Codex"),
+            "and the others stay off -- this is the bug"
+        );
+    }
+
+    #[test]
+    fn turning_off_a_source_while_others_remain_still_works() {
+        // The guard must only catch the final entry, not ordinary toggling.
+        let mut cfg = NotificationConfig::default();
+        cfg.allowed_apps.clear();
+        cfg.add_app("Hermes");
+        cfg.add_app("Wavesurf");
+
+        assert!(cfg.set_app_allowed("Hermes", false), "not the last one");
+
+        assert!(!cfg.is_app_allowed("Hermes"));
+        assert!(cfg.is_app_allowed("Wavesurf"), "the survivor stays allowed");
+        assert_eq!(cfg.allowed_apps, vec!["Wavesurf".to_string()]);
+
+        // And the survivor can now be re-enabled freely.
+        assert!(
+            cfg.set_app_allowed("Hermes", true),
+            "re-enabling always works"
+        );
+        assert!(cfg.is_app_allowed("Hermes"));
+    }
+
+    #[test]
+    fn removing_a_source_is_unaffected_by_the_allowlist_guard() {
+        // Removal is a different operation and must still work when the
+        // source being removed is the only allowed one.
+        let mut cfg = NotificationConfig::default();
+        cfg.allowed_apps.clear();
+        cfg.add_app("Hermes");
+        cfg.add_app("Wavesurf");
+        cfg.set_app_allowed("Wavesurf", false);
+
+        assert!(cfg.remove_app("Hermes"));
+
+        assert!(!has(&cfg, "Hermes"));
+        assert!(
+            cfg.is_app_allowed("Wavesurf"),
+            "removing the last allowed source must not empty the allowlist \
+             and re-enable everything"
+        );
     }
 
     #[test]
