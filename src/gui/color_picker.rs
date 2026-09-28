@@ -208,7 +208,7 @@ pub fn color_picker_button(ui: &mut Ui, id_source: &str, color: &mut [f32; 4]) -
     let is_open = ui.memory(|m| m.is_popup_open(popup_id));
 
     if ui.is_rect_visible(rect) {
-        let rounding = Rounding::same(6.0);
+        let rounding = Rounding::same(6);
 
         // Background of the trigger button
         let bg = if is_open {
@@ -233,6 +233,7 @@ pub fn color_picker_button(ui: &mut Ui, id_source: &str, color: &mut [f32; 4]) -
                     theme::divider().gamma_multiply(0.6)
                 },
             ),
+            egui::epaint::StrokeKind::Middle,
         );
 
         // Color preview swatch box (left side)
@@ -240,7 +241,7 @@ pub fn color_picker_button(ui: &mut Ui, id_source: &str, color: &mut [f32; 4]) -
             Pos2::new(rect.left() + 6.0, rect.top() + 5.0),
             Vec2::new(26.0, 18.0),
         );
-        let swatch_rounding = Rounding::same(4.0);
+        let swatch_rounding = Rounding::same(4);
 
         // Checkerboard underlay for transparency preview
         draw_checkerboard(
@@ -263,6 +264,7 @@ pub fn color_picker_button(ui: &mut Ui, id_source: &str, color: &mut [f32; 4]) -
             swatch_rect,
             swatch_rounding,
             Stroke::new(1.0, Color32::from_white_alpha(35)),
+            egui::epaint::StrokeKind::Middle,
         );
 
         // Hex Code Text
@@ -294,7 +296,9 @@ pub fn color_picker_button(ui: &mut Ui, id_source: &str, color: &mut [f32; 4]) -
 
     // Popup Panel Rendering
     let mut changed = false;
-    egui::popup::popup_above_or_below_widget(
+    // 0.34 moved the legacy popup helpers to `egui::old_popup`; the signature
+    // and behaviour are unchanged.
+    egui::old_popup::popup_above_or_below_widget(
         ui,
         popup_id,
         &response,
@@ -325,7 +329,7 @@ pub fn color_picker_button(ui: &mut Ui, id_source: &str, color: &mut [f32; 4]) -
             ui.horizontal(|ui| {
                 let header_swatch_size = Vec2::new(32.0, 24.0);
                 let (h_rect, _) = ui.allocate_exact_size(header_swatch_size, Sense::hover());
-                let h_round = Rounding::same(4.0);
+                let h_round = Rounding::same(4);
 
                 draw_checkerboard(
                     ui.painter(),
@@ -342,8 +346,12 @@ pub fn color_picker_button(ui: &mut Ui, id_source: &str, color: &mut [f32; 4]) -
                     (color[3] * 255.0) as u8,
                 );
                 ui.painter().rect_filled(h_rect, h_round, c_active);
-                ui.painter()
-                    .rect_stroke(h_rect, h_round, Stroke::new(1.0, theme::divider()));
+                ui.painter().rect_stroke(
+                    h_rect,
+                    h_round,
+                    Stroke::new(1.0, theme::divider()),
+                    egui::epaint::StrokeKind::Middle,
+                );
 
                 ui.vertical(|ui| {
                     ui.horizontal(|ui| {
@@ -359,7 +367,9 @@ pub fn color_picker_button(ui: &mut Ui, id_source: &str, color: &mut [f32; 4]) -
                             .on_hover_text("Copy Hex Code")
                             .clicked()
                         {
-                            ui.output_mut(|o| o.copied_text = rgba_to_hex(*color, state.a < 1.0));
+                            // 0.34 replaced the `copied_text` output field with
+                            // an explicit copy command.
+                            ui.ctx().copy_text(rgba_to_hex(*color, state.a < 1.0));
                         }
                     });
                 });
@@ -427,8 +437,9 @@ pub fn color_picker_button(ui: &mut Ui, id_source: &str, color: &mut [f32; 4]) -
 
                 ui.painter().rect_stroke(
                     sv_rect,
-                    Rounding::same(4.0),
+                    Rounding::same(4),
                     Stroke::new(1.0, theme::divider()),
+                    egui::epaint::StrokeKind::Middle,
                 );
 
                 // SV Reticle handle
@@ -511,8 +522,9 @@ pub fn color_picker_button(ui: &mut Ui, id_source: &str, color: &mut [f32; 4]) -
 
                 ui.painter().rect_stroke(
                     hue_rect,
-                    Rounding::same(6.0),
+                    Rounding::same(6),
                     Stroke::new(1.0, theme::divider()),
+                    egui::epaint::StrokeKind::Middle,
                 );
 
                 // Hue Thumb
@@ -589,8 +601,9 @@ pub fn color_picker_button(ui: &mut Ui, id_source: &str, color: &mut [f32; 4]) -
 
                 ui.painter().rect_stroke(
                     alpha_rect,
-                    Rounding::same(6.0),
+                    Rounding::same(6),
                     Stroke::new(1.0, theme::divider()),
+                    egui::epaint::StrokeKind::Middle,
                 );
 
                 // Alpha Thumb
@@ -825,7 +838,7 @@ pub fn color_picker_button(ui: &mut Ui, id_source: &str, color: &mut [f32; 4]) -
                             Color32::from_gray(50),
                             Color32::from_gray(90),
                         );
-                        let s_rounding = Rounding::same(3.0);
+                        let s_rounding = Rounding::same(3);
                         ui.painter().rect_filled(s_rect, s_rounding, c);
                         ui.painter().rect_stroke(
                             s_rect,
@@ -838,6 +851,7 @@ pub fn color_picker_button(ui: &mut Ui, id_source: &str, color: &mut [f32; 4]) -
                                     theme::divider()
                                 },
                             ),
+                            egui::epaint::StrokeKind::Middle,
                         );
                     }
                 }

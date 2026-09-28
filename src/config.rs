@@ -293,6 +293,41 @@ impl NotificationGlowStyle {
     }
 }
 
+/// What a registered notification source actually is.
+///
+/// This is metadata for the user, not a permission. `is_app_allowed` never
+/// consults it, and neither does webhook matching -- both key off the source
+/// name alone.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub enum SourceKind {
+    /// A bare source name chosen by the user, for anything that is not a
+    /// Windows executable: agents, CI, scripts, Git hooks.
+    #[default]
+    Custom,
+    /// A real Windows application, whose executable the user picked once by
+    /// hand. The path is a label for the user's benefit only.
+    WindowsApp,
+}
+
+/// One row of the Settings source registry.
+///
+/// A view over the existing config fields rather than a new store: the
+/// registry is still the union of `allowed_apps` and `app_colors`, and an
+/// entry present in only one of them is still a row.
+#[derive(Debug, Clone, PartialEq)]
+pub struct RegistryEntry {
+    /// The source name, which is also the webhook `app` identifier.
+    pub name: String,
+    /// Membership in `allowed_apps` -- whether this source may toast.
+    pub allowed: bool,
+    /// Whether the user has picked a colour for it yet.
+    pub has_color: bool,
+    /// Which kind of source this is. Absent from `source_kinds` means Custom.
+    pub kind: SourceKind,
+    /// The executable the user selected, for Windows-app sources only.
+    pub exe: Option<String>,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct NotificationConfig {
@@ -308,6 +343,13 @@ pub struct NotificationConfig {
     pub glow_style: NotificationGlowStyle,
     /// Custom RGBA colors mapped per application name.
     pub app_colors: std::collections::HashMap<String, [f32; 4]>,
+    /// Which kind of source each name is. Absent means
+    /// [`SourceKind::Custom`], which is what every pre-V2 entry is.
+    pub source_kinds: std::collections::HashMap<String, SourceKind>,
+    /// The executable each Windows-app source points at, as the user
+    /// selected it. Never canonicalized, never revalidated, never used for
+    /// matching -- see [`SourceKind`].
+    pub source_exes: std::collections::HashMap<String, String>,
 }
 
 impl Default for NotificationConfig {
@@ -337,11 +379,235 @@ impl Default for NotificationConfig {
             sound_enabled: true,
             glow_style: NotificationGlowStyle::CountdownDrain,
             app_colors,
+            source_kinds: std::collections::HashMap::new(),
+            source_exes: std::collections::HashMap::new(),
         }
     }
 }
 
 impl NotificationConfig {
+    /// Colour handed to an application that has never had one picked for it.
+    /// Matches the `Info` badge colour, so an unconfigured app looks the same
+    /// as it always has rather than picking up a new identity here.
+    pub const DEFAULT_APP_COLOR: [f32; 4] = [0.22, 0.74, 0.97, 1.0];
+
+    /// Longest application name the registry will store. Long enough for any
+    /// real product name, short enough that a hostile webhook cannot bloat
+    /// the config with one enormous key.
+    pub const MAX_APP_NAME_LEN: usize = 64;
+
+    /// Every source this config knows about, as a row of the Settings view.
+    ///
+    /// This is the union of the notification allowlist and the colour map,
+    /// which is exactly what [`Self::app_registry`] returns -- the same set,
+    /// carried into the shape the UI renders. Either list can hold a name the
+    /// other does not: a source may be allowed but uncoloured, or coloured
+    /// but not allowed. Both belong in Settings, so both are surfaced. Order
+    /// is stable -- allowlisted sources first, then colour-only ones -- and
+    /// each is deduped case-insensitively.
+    pub fn registry_entries(&self) -> Vec<RegistryEntry> {
+        self.app_registry()
+            .into_iter()
+            .map(|name| RegistryEntry {
+                kind: self.source_kind(&name),
+                exe: self.source_exes.get(&name).cloned(),
+                allowed: self.is_app_allowed(&name),
+                has_color: self
+                    .app_colors
+                    .keys()
+                    .any(|existing| existing.eq_ignore_ascii_case(&name)),
+                name,
+            })
+            .collect()
+    }
+
+    /// Which kind of source this name is. An absent entry means
+    /// [`SourceKind::Custom`], which is correct for every source registered
+    /// before V2 as well as for any added as one.
+    pub fn source_kind(&self, name: &str) -> SourceKind {
+        if let Some(kind) = self.source_kinds.get(name) {
+            return *kind;
+        }
+        self.source_kinds
+            .iter()
+            .find(|(key, _)| key.eq_ignore_ascii_case(name))
+            .map(|(_, kind)| *kind)
+            .unwrap_or_default()
+    }
+
+    /// Every source this config knows about, as a union of the notification
+    /// allowlist and the colour map.
+    ///
+    /// Either list can hold a name the other does not: an app may be allowed
+    /// but uncoloured, or coloured but not allowed. Both belong in Settings,
+    /// so both are surfaced. Order is stable -- allowlisted apps first, then
+    /// colour-only apps -- and each is deduped case-insensitively.
+    pub fn app_registry(&self) -> Vec<String> {
+        let mut seen: Vec<String> = Vec::new();
+
+        for name in self.allowed_apps.iter().chain(self.app_colors.keys()) {
+            if !seen
+                .iter()
+                .any(|existing| existing.eq_ignore_ascii_case(name))
+            {
+                seen.push(name.clone());
+            }
+        }
+
+        seen
+    }
+
+    /// Whether this app may raise a notification toast. An empty allowlist
+    /// means "everything", which is the long-standing behaviour and stays.
+    pub fn is_app_allowed(&self, app: &str) -> bool {
+        self.allowed_apps.is_empty()
+            || self
+                .allowed_apps
+                .iter()
+                .any(|a| a.eq_ignore_ascii_case(app))
+    }
+
+    /// Clean up user input and reject names that cannot be stored.
+    ///
+    /// Returns the name trimmed to its canonical form, or `None` when it is
+    /// empty, whitespace-only, or longer than [`Self::MAX_APP_NAME_LEN`].
+    /// Display casing is preserved; only surrounding whitespace goes.
+    pub fn normalize_app_name(input: &str) -> Option<String> {
+        let name = input.trim();
+        if name.is_empty() || name.len() > Self::MAX_APP_NAME_LEN {
+            return None;
+        }
+        Some(name.to_string())
+    }
+
+    /// Register a new application: allowed to notify, with a default colour.
+    ///
+    /// Returns `false` when the name is invalid or already registered in any
+    /// casing, so the caller can report the rejection rather than silently
+    /// adding a near-duplicate. The colour is written eagerly because the
+    /// picker needs something to edit and store.
+    pub fn add_app(&mut self, input: &str) -> bool {
+        let Some(name) = Self::normalize_app_name(input) else {
+            return false;
+        };
+
+        let already_known = self
+            .allowed_apps
+            .iter()
+            .chain(self.app_colors.keys())
+            .any(|existing| existing.eq_ignore_ascii_case(&name));
+        if already_known {
+            return false;
+        }
+
+        self.allowed_apps.push(name.clone());
+        self.app_colors.insert(name, Self::DEFAULT_APP_COLOR);
+        true
+    }
+
+    /// Register a source explicitly, as either kind.
+    ///
+    /// A custom source writes only the name, which already reads back as
+    /// [`SourceKind::Custom`] because that is the fallback -- so there is
+    /// nothing to record. A Windows application additionally records its kind
+    /// and the executable the user picked. Neither the kind nor the path is
+    /// consulted when deciding whether a notification is allowed.
+    ///
+    /// Returns `false` when the name is invalid or already registered in any
+    /// casing, so the caller can report the rejection rather than silently
+    /// adding a near-duplicate.
+    pub fn add_source(&mut self, input: &str, kind: SourceKind, exe: Option<&str>) -> bool {
+        if !self.add_app(input) {
+            return false;
+        }
+
+        let name = input.trim().to_string();
+        if kind == SourceKind::WindowsApp {
+            self.source_kinds
+                .insert(name.clone(), SourceKind::WindowsApp);
+            // Stored exactly as chosen: not canonicalized, and never checked
+            // again. A moved executable does not stop the source working,
+            // because delivery depends on the name alone.
+            if let Some(exe) = exe {
+                self.source_exes.insert(name, exe.to_string());
+            }
+        }
+
+        true
+    }
+
+    /// Drop a source from every structure it appears in: the allowlist, the
+    /// colour map, the kind map and the executable map. Any of them may be
+    /// the only place it appears, so all are cleared. No other source is
+    /// touched.
+    pub fn remove_app(&mut self, app: &str) -> bool {
+        let before = self.allowed_apps.len() + self.app_colors.len();
+
+        self.allowed_apps
+            .retain(|existing| !existing.eq_ignore_ascii_case(app));
+
+        self.app_colors
+            .retain(|existing, _| !existing.eq_ignore_ascii_case(app));
+
+        self.source_kinds
+            .retain(|existing, _| !existing.eq_ignore_ascii_case(app));
+
+        self.source_exes
+            .retain(|existing, _| !existing.eq_ignore_ascii_case(app));
+
+        before
+            != self.allowed_apps.len()
+                + self.app_colors.len()
+                + self.source_kinds.len()
+                + self.source_exes.len()
+    }
+
+    /// Allow or disallow an application, leaving its colour alone.
+    ///
+    /// Disallowing keeps the name in the registry -- it just stops toasting --
+    /// so the user can switch it back on without re-adding it.
+    ///
+    /// Returns `false` when the request was refused because an empty
+    /// allowlist means "everything allowed" (see [`Self::is_app_allowed`]),
+    /// so the last remaining source cannot be turned off. Callers should
+    /// surface that to the user rather than silently doing nothing.
+    pub fn set_app_allowed(&mut self, app: &str, allowed: bool) -> bool {
+        let present = self
+            .allowed_apps
+            .iter()
+            .any(|existing| existing.eq_ignore_ascii_case(app));
+
+        match (allowed, present) {
+            (true, false) => {
+                self.allowed_apps.push(app.trim().to_string());
+                true
+            }
+            // Removing the last entry would leave the allowlist empty, which
+            // reads as "allow everything" and silently re-enables every
+            // source in the registry. Refuse instead.
+            (false, true) if self.allowed_apps.len() == 1 => false,
+            (false, true) => {
+                self.allowed_apps
+                    .retain(|existing| !existing.eq_ignore_ascii_case(app));
+                true
+            }
+            // An empty allowlist is the long-standing "everything is allowed"
+            // shorthand, so there is no entry to remove. Turning one app off
+            // then has to become explicit: name every other app first, or the
+            // toggle would read as doing nothing.
+            (false, false) if self.allowed_apps.is_empty() => {
+                let others: Vec<String> = self
+                    .app_registry()
+                    .into_iter()
+                    .filter(|name| !name.eq_ignore_ascii_case(app))
+                    .collect();
+                self.allowed_apps = others;
+                true
+            }
+            _ => true,
+        }
+    }
+
     pub fn get_app_color(&self, app: &str) -> [f32; 4] {
         if let Some(c) = self.app_colors.get(app) {
             return *c;
@@ -351,17 +617,7 @@ impl NotificationConfig {
                 return *v;
             }
         }
-        match app.to_lowercase().as_str() {
-            "antigravity" => [0.0, 0.94, 1.0, 1.0],
-            "codex" => [0.06, 0.72, 0.51, 1.0],
-            "claude" => [0.98, 0.45, 0.09, 1.0],
-            "cursor" => [0.39, 0.40, 0.95, 1.0],
-            "terminal" => [0.66, 0.33, 0.97, 1.0],
-            "vs code" | "vscode" => [0.0, 0.47, 0.83, 1.0],
-            "slack" => [0.88, 0.12, 0.35, 1.0],
-            "discord" => [0.35, 0.40, 0.95, 1.0],
-            _ => [0.22, 0.74, 0.97, 1.0],
-        }
+        Self::DEFAULT_APP_COLOR
     }
 }
 
@@ -1015,5 +1271,518 @@ impl AppConfig {
         if let Ok(content) = serde_json::to_string_pretty(self) {
             let _ = fs::write(path, content);
         }
+    }
+}
+
+#[cfg(test)]
+mod notification_registry_tests {
+    use super::*;
+
+    fn has(cfg: &NotificationConfig, name: &str) -> bool {
+        cfg.app_registry()
+            .iter()
+            .any(|a| a.eq_ignore_ascii_case(name))
+    }
+
+    #[test]
+    fn registry_unions_allowlist_and_colors() {
+        let mut cfg = NotificationConfig::default();
+        // A colour-only app: not allowed, but should still be visible.
+        cfg.app_colors
+            .insert("ColorOnly".to_string(), [1.0, 0.0, 0.0, 1.0]);
+        // An allowlist-only app: allowed, never coloured.
+        cfg.allowed_apps.push("AllowOnly".to_string());
+
+        let names = cfg.app_registry();
+
+        assert!(names.contains(&"ColorOnly".to_string()));
+        assert!(names.contains(&"AllowOnly".to_string()));
+        for preset in ["Antigravity", "Codex", "Claude", "Discord"] {
+            assert!(
+                has(&cfg, preset),
+                "default app {preset} missing from registry"
+            );
+        }
+    }
+
+    #[test]
+    fn add_app_registers_in_both_lists() {
+        let mut cfg = NotificationConfig::default();
+        assert!(cfg.add_app("Hermes"));
+
+        assert!(cfg.allowed_apps.iter().any(|a| a == "Hermes"));
+        assert!(cfg
+            .app_colors
+            .get("Hermes")
+            .copied()
+            .is_some_and(|c| c == NotificationConfig::DEFAULT_APP_COLOR));
+        assert!(cfg.is_app_allowed("Hermes"));
+    }
+
+    #[test]
+    fn add_app_rejects_duplicates_and_bad_input() {
+        let mut cfg = NotificationConfig::default();
+        assert!(cfg.add_app("Hermes"));
+
+        // Same app, different casing, must not be added twice.
+        assert!(!cfg.add_app("hermes"));
+        assert!(!cfg.add_app("HERMES"));
+        assert_eq!(
+            cfg.allowed_apps
+                .iter()
+                .filter(|a| a.eq_ignore_ascii_case("Hermes"))
+                .count(),
+            1
+        );
+
+        // Names that cannot be stored.
+        assert!(!cfg.add_app(""));
+        assert!(!cfg.add_app("   "));
+        assert!(!cfg.add_app(&"x".repeat(NotificationConfig::MAX_APP_NAME_LEN + 1)));
+
+        // An existing default app is a duplicate, not a new entry.
+        assert!(!cfg.add_app("discord"));
+    }
+
+    #[test]
+    fn add_app_preserves_display_casing() {
+        let mut cfg = NotificationConfig::default();
+        assert!(cfg.add_app("  OpenClaw  "));
+        assert!(cfg.allowed_apps.iter().any(|a| a == "OpenClaw"));
+    }
+
+    #[test]
+    fn remove_app_clears_both_lists() {
+        let mut cfg = NotificationConfig::default();
+        cfg.add_app("Hermes");
+        assert!(cfg.remove_app("hermes"));
+
+        assert!(!cfg.allowed_apps.iter().any(|a| a == "Hermes"));
+        assert!(!cfg.app_colors.contains_key("Hermes"));
+        assert!(!has(&cfg, "Hermes"));
+
+        // Built-ins survive the removal.
+        assert!(has(&cfg, "Claude"));
+        // Removing something absent is a no-op, not a silent success.
+        assert!(!cfg.remove_app("NeverExisted"));
+    }
+
+    #[test]
+    fn toggling_permission_keeps_the_app_registered() {
+        let mut cfg = NotificationConfig::default();
+        cfg.add_app("Hermes");
+
+        cfg.set_app_allowed("Hermes", false);
+        assert!(!cfg.is_app_allowed("Hermes"));
+        // Still known, so it can be switched back on without re-adding.
+        assert!(has(&cfg, "Hermes"));
+        assert!(cfg.app_colors.contains_key("Hermes"));
+
+        cfg.set_app_allowed("Hermes", true);
+        assert!(cfg.is_app_allowed("Hermes"));
+    }
+
+    #[test]
+    fn empty_allowlist_still_means_everything() {
+        let cfg = NotificationConfig::default();
+        assert!(cfg.is_app_allowed("Antigravity"));
+
+        let mut open = NotificationConfig::default();
+        open.allowed_apps.clear();
+        assert!(open.is_app_allowed("AnythingAtAll"));
+    }
+
+    #[test]
+    fn disabling_from_wildcard_allowlist_becomes_explicit() {
+        // An empty allowlist means "all allowed", so there is no entry to
+        // remove. The toggle still has to take effect, which means naming
+        // every other app instead of silently doing nothing.
+        let mut cfg = NotificationConfig::default();
+        cfg.allowed_apps.clear();
+        assert!(cfg.is_app_allowed("Claude"));
+
+        cfg.set_app_allowed("Claude", false);
+
+        assert!(!cfg.is_app_allowed("Claude"));
+        assert!(
+            cfg.is_app_allowed("Codex"),
+            "other apps should stay allowed"
+        );
+        // The app is still registered, so it can be switched back on.
+        assert!(has(&cfg, "Claude"));
+    }
+
+    #[test]
+    fn the_last_allowed_source_cannot_be_turned_off() {
+        // Regression: deselecting every source in turn used to empty the
+        // allowlist, and an empty allowlist means "all allowed" -- so the
+        // whole registry silently switched itself back on.
+        let mut cfg = NotificationConfig::default();
+        cfg.allowed_apps.clear();
+        cfg.add_app("Hermes");
+
+        // Clear the wildcard back to just this one source.
+        for name in cfg.app_registry() {
+            if !name.eq_ignore_ascii_case("Hermes") {
+                cfg.set_app_allowed(&name, false);
+            }
+        }
+        assert_eq!(cfg.allowed_apps, vec!["Hermes".to_string()]);
+
+        // `set_app_allowed` reports false when it refuses the change.
+        let accepted = cfg.set_app_allowed("Hermes", false);
+
+        assert!(!accepted, "the last deselect must be refused");
+        assert_eq!(
+            cfg.allowed_apps,
+            vec!["Hermes".to_string()],
+            "the allowlist must not be emptied, or every source re-enables"
+        );
+        assert!(cfg.is_app_allowed("Hermes"), "Hermes stays enabled");
+        assert!(
+            !cfg.is_app_allowed("Codex"),
+            "and the others stay off -- this is the bug"
+        );
+    }
+
+    #[test]
+    fn turning_off_a_source_while_others_remain_still_works() {
+        // The guard must only catch the final entry, not ordinary toggling.
+        let mut cfg = NotificationConfig::default();
+        cfg.allowed_apps.clear();
+        cfg.add_app("Hermes");
+        cfg.add_app("Wavesurf");
+
+        assert!(cfg.set_app_allowed("Hermes", false), "not the last one");
+
+        assert!(!cfg.is_app_allowed("Hermes"));
+        assert!(cfg.is_app_allowed("Wavesurf"), "the survivor stays allowed");
+        assert_eq!(cfg.allowed_apps, vec!["Wavesurf".to_string()]);
+
+        // And the survivor can now be re-enabled freely.
+        assert!(
+            cfg.set_app_allowed("Hermes", true),
+            "re-enabling always works"
+        );
+        assert!(cfg.is_app_allowed("Hermes"));
+    }
+
+    #[test]
+    fn removing_a_source_is_unaffected_by_the_allowlist_guard() {
+        // Removal is a different operation and must still work when the
+        // source being removed is the only allowed one.
+        let mut cfg = NotificationConfig::default();
+        cfg.allowed_apps.clear();
+        cfg.add_app("Hermes");
+        cfg.add_app("Wavesurf");
+        cfg.set_app_allowed("Wavesurf", false);
+
+        assert!(cfg.remove_app("Hermes"));
+
+        assert!(!has(&cfg, "Hermes"));
+        assert!(
+            cfg.is_app_allowed("Wavesurf"),
+            "removing the last allowed source must not empty the allowlist \
+             and re-enable everything"
+        );
+    }
+
+    #[test]
+    fn uncoloured_allowed_app_falls_back_and_is_editable() {
+        let mut cfg = NotificationConfig::default();
+        cfg.add_app("Hermes");
+        // Simulate a config written before this app had a colour.
+        cfg.app_colors.remove("Hermes");
+
+        let fallback = cfg.get_app_color("Hermes");
+        assert_eq!(fallback, NotificationConfig::DEFAULT_APP_COLOR);
+        assert!(has(&cfg, "Hermes"));
+
+        // And the fallback is storable, which is what the picker needs.
+        cfg.app_colors
+            .insert("Hermes".to_string(), [0.5, 0.1, 0.9, 1.0]);
+        assert_eq!(cfg.get_app_color("Hermes"), [0.5, 0.1, 0.9, 1.0]);
+    }
+
+    #[test]
+    fn legacy_config_without_new_fields_still_loads() {
+        // A config.json written before the registry existed: the two fields
+        // the registry is built from, and nothing else.
+        let legacy = r#"{
+            "enabled": true,
+            "allowed_apps": ["Claude", "Custom App"],
+            "toast_duration_secs": 4.5,
+            "webhook_port": 18923,
+            "sound_enabled": true,
+            "glow_style": "CountdownDrain",
+            "app_colors": {"Custom App": [0.1, 0.2, 0.3, 1.0]}
+        }"#;
+
+        let cfg: NotificationConfig = serde_json::from_str(legacy).expect("legacy config parses");
+
+        assert!(cfg.is_app_allowed("Custom App"));
+        assert_eq!(cfg.get_app_color("Custom App"), [0.1, 0.2, 0.3, 1.0]);
+        // Present in the allowlist but never coloured -> fallback, still listed.
+        assert!(has(&cfg, "Claude"));
+        assert_eq!(
+            cfg.get_app_color("Claude"),
+            NotificationConfig::DEFAULT_APP_COLOR
+        );
+    }
+
+    #[test]
+    fn every_default_app_still_has_its_own_colour() {
+        // The hard-coded colour match was removed on the strength of this:
+        // the seeded map must cover every built-in.
+        let cfg = NotificationConfig::default();
+        let distinct: Vec<[f32; 4]> = cfg
+            .app_registry()
+            .iter()
+            .map(|a| cfg.get_app_color(a))
+            .collect();
+
+        for (name, color) in cfg.app_colors.iter() {
+            assert!(
+                distinct.contains(color),
+                "built-in {name} lost its colour after removing the match fallback"
+            );
+        }
+        // Built-ins are not all the same colour, i.e. the map really is used.
+        let mut unique = distinct.clone();
+        unique.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        unique.dedup();
+        assert!(unique.len() > 1);
+    }
+
+    #[test]
+    fn registry_round_trips_through_serde() {
+        let mut cfg = NotificationConfig::default();
+        cfg.add_app("Hermes");
+        cfg.app_colors
+            .insert("Hermes".to_string(), [0.9, 0.1, 0.1, 1.0]);
+
+        let text = serde_json::to_string_pretty(&cfg).unwrap();
+        let back: NotificationConfig = serde_json::from_str(&text).unwrap();
+
+        assert!(back.is_app_allowed("Hermes"));
+        assert_eq!(back.get_app_color("Hermes"), [0.9, 0.1, 0.1, 1.0]);
+        assert!(has(&back, "Hermes"));
+    }
+}
+
+#[cfg(test)]
+mod notification_source_kind_tests {
+    use super::*;
+
+    fn entry<'a>(entries: &'a [RegistryEntry], name: &str) -> &'a RegistryEntry {
+        entries
+            .iter()
+            .find(|e| e.name.eq_ignore_ascii_case(name))
+            .unwrap_or_else(|| panic!("no registry entry for {name}"))
+    }
+
+    /// A V1-shaped config: the two fields that existed before V2, and nothing
+    /// else. This is what every pre-V2 user has on disk.
+    fn v1_shaped() -> NotificationConfig {
+        let mut cfg = NotificationConfig::default();
+        cfg.allowed_apps = vec!["Hermes".to_string(), "CI".to_string()];
+        cfg
+    }
+
+    #[test]
+    fn absent_source_kinds_reads_as_custom() {
+        let cfg = v1_shaped();
+
+        // No `source_kinds` was ever written for these names.
+        assert!(cfg.source_kinds.is_empty());
+
+        for e in cfg.registry_entries() {
+            assert_eq!(
+                e.kind,
+                SourceKind::Custom,
+                "{} should default to Custom",
+                e.name
+            );
+            assert_eq!(cfg.source_kind(&e.name), SourceKind::Custom);
+        }
+    }
+
+    #[test]
+    fn absent_source_exes_reports_no_executable() {
+        let cfg = v1_shaped();
+
+        assert!(cfg.source_exes.is_empty());
+        for e in cfg.registry_entries() {
+            assert!(e.exe.is_none(), "{} should have no exe", e.name);
+        }
+    }
+
+    #[test]
+    fn adding_windows_app_writes_kind_exe_allowlist_and_color() {
+        let mut cfg = NotificationConfig::default();
+
+        assert!(cfg.add_source(
+            "Wavesurf",
+            SourceKind::WindowsApp,
+            Some(r"E:\Apps\Wavesurf\wavesurf.exe")
+        ));
+
+        // All four structures the design promises, in one call.
+        assert!(cfg.allowed_apps.iter().any(|a| a == "Wavesurf"));
+        assert_eq!(
+            cfg.get_app_color("Wavesurf"),
+            NotificationConfig::DEFAULT_APP_COLOR
+        );
+        assert_eq!(cfg.source_kind("Wavesurf"), SourceKind::WindowsApp);
+        assert_eq!(
+            cfg.source_exes.get("Wavesurf").map(String::as_str),
+            Some(r"E:\Apps\Wavesurf\wavesurf.exe")
+        );
+
+        let entries = cfg.registry_entries();
+        let e = entry(&entries, "Wavesurf");
+        assert!(e.allowed && e.has_color);
+        assert_eq!(e.kind, SourceKind::WindowsApp);
+    }
+
+    #[test]
+    fn adding_custom_leaves_source_kinds_absent() {
+        let mut cfg = NotificationConfig::default();
+
+        assert!(cfg.add_source("Hermes2", SourceKind::Custom, None));
+
+        // Custom is the fallback, so nothing needs writing -- which is what
+        // keeps a custom add identical to the V1 code path.
+        assert!(!cfg.source_kinds.contains_key("Hermes2"));
+        assert_eq!(cfg.source_kind("Hermes2"), SourceKind::Custom);
+        assert!(cfg.source_exes.is_empty());
+        assert!(cfg.allowed_apps.iter().any(|a| a == "Hermes2"));
+        assert_eq!(
+            cfg.get_app_color("Hermes2"),
+            NotificationConfig::DEFAULT_APP_COLOR
+        );
+    }
+
+    #[test]
+    fn remove_clears_kind_and_exe() {
+        let mut cfg = NotificationConfig::default();
+        cfg.add_source("Wavesurf", SourceKind::WindowsApp, Some(r"C:\w.exe"));
+        cfg.add_source("Hermes", SourceKind::Custom, None);
+
+        assert!(cfg.remove_app("Wavesurf"));
+
+        // Gone from all four structures...
+        assert!(!cfg.allowed_apps.iter().any(|a| a == "Wavesurf"));
+        assert!(!cfg.app_colors.contains_key("Wavesurf"));
+        assert!(!cfg.source_kinds.contains_key("Wavesurf"));
+        assert!(!cfg.source_exes.contains_key("Wavesurf"));
+
+        // ...and the other source is untouched.
+        assert!(cfg.allowed_apps.iter().any(|a| a == "Hermes"));
+        assert_eq!(cfg.source_kind("Hermes"), SourceKind::Custom);
+    }
+
+    #[test]
+    fn old_v1_config_still_loads() {
+        // Exactly the JSON a pre-V2 install would have on disk: no
+        // source_kinds, no source_exes.
+        let raw = r#"{
+            "enabled": true,
+            "allowed_apps": ["VS Code", "Hermes"],
+            "toast_duration_secs": 4.0,
+            "webhook_port": 18923,
+            "sound_enabled": true,
+            "glow_style": "CountdownDrain",
+            "app_colors": {"VS Code": [0.0, 0.47, 0.83, 1.0], "Hermes": [0.9, 0.1, 0.1, 1.0]}
+        }"#;
+
+        let cfg: NotificationConfig = serde_json::from_str(raw).expect("V1 config must load");
+
+        assert!(cfg.source_kinds.is_empty());
+        assert!(cfg.source_exes.is_empty());
+        assert_eq!(cfg.source_kind("Hermes"), SourceKind::Custom);
+        assert!(cfg.is_app_allowed("Hermes"));
+        assert_eq!(cfg.get_app_color("Hermes"), [0.9, 0.1, 0.1, 1.0]);
+
+        // And it survives a round trip without gaining anything.
+        let again: NotificationConfig =
+            serde_json::from_str(&serde_json::to_string(&cfg).unwrap()).unwrap();
+        assert_eq!(again.source_kind("VS Code"), SourceKind::Custom);
+    }
+
+    #[test]
+    fn exe_path_is_not_consulted_by_is_app_allowed() {
+        let mut cfg = NotificationConfig::default();
+
+        // One source with an executable, one without, otherwise identical.
+        assert!(cfg.add_source("Wavesurf", SourceKind::WindowsApp, Some(r"C:\gone.exe")));
+        assert!(cfg.add_source("Hermes", SourceKind::Custom, None));
+
+        // The path deliberately points at a file that does not exist. It is
+        // never opened, so the permission is identical to a custom source's.
+        assert!(cfg.is_app_allowed("Wavesurf"));
+        assert!(cfg.is_app_allowed("Hermes"));
+
+        // Disabling works the same way for both kinds, and does not
+        // disturb the other source: the allowlist holds both names, so
+        // dropping one leaves the other allowed.
+        cfg.set_app_allowed("Wavesurf", false);
+        assert!(!cfg.is_app_allowed("Wavesurf"));
+        assert!(
+            cfg.is_app_allowed("Hermes"),
+            "disabling one source must not affect another"
+        );
+
+        // Dropping the metadata changes nothing about permission either.
+        cfg.source_kinds.clear();
+        cfg.source_exes.clear();
+        assert!(cfg.is_app_allowed("Hermes"));
+    }
+
+    #[test]
+    fn duplicate_names_differing_by_case_are_rejected() {
+        let mut cfg = NotificationConfig::default();
+
+        assert!(cfg.add_source("Wavesurf", SourceKind::WindowsApp, Some(r"C:\w.exe")));
+        assert!(!cfg.add_source("wavesurf", SourceKind::WindowsApp, Some(r"C:\other.exe")));
+        assert!(!cfg.add_source("WAVESURF", SourceKind::Custom, None));
+
+        // Exactly one entry, and the first executable won.
+        let matching = cfg
+            .app_registry()
+            .iter()
+            .filter(|n| n.eq_ignore_ascii_case("wavesurf"))
+            .count();
+        assert_eq!(matching, 1);
+        assert_eq!(
+            cfg.source_exes.get("Wavesurf").map(String::as_str),
+            Some(r"C:\w.exe")
+        );
+    }
+
+    #[test]
+    fn registry_still_unions_allowlist_and_colors() {
+        let mut cfg = NotificationConfig::default();
+
+        // Present in allowed_apps but not app_colors.
+        assert!(cfg.add_source("OnlyAllowed", SourceKind::Custom, None));
+        cfg.app_colors.remove("OnlyAllowed");
+
+        // Present in app_colors but not allowed_apps.
+        cfg.app_colors
+            .insert("OnlyColoured".to_string(), [1.0, 0.0, 0.0, 1.0]);
+
+        let entries = cfg.registry_entries();
+        let a = entry(&entries, "OnlyAllowed");
+        assert!(a.allowed && !a.has_color);
+        let c = entry(&entries, "OnlyColoured");
+        assert!(!c.allowed && c.has_color);
+
+        // Same set the V1 view produced, not a narrower one.
+        assert_eq!(
+            entries.len(),
+            cfg.app_registry().len(),
+            "the view must cover exactly the union"
+        );
     }
 }

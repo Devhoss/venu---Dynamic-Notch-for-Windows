@@ -122,6 +122,7 @@ pub struct Painter {
     pub media: MediaWatcher,
     media_art: Option<CachedArt>,
     media_art_failed: Option<u64>,
+
     /// Raised by the drawing code while a frame is being painted. A `Cell`
     /// because the slides that report it are split between `&self` and
     /// `&mut self` methods and threading a flag back out of every one of them
@@ -214,6 +215,7 @@ impl Painter {
             media: MediaWatcher::spawn(),
             media_art: None,
             media_art_failed: None,
+
             motion: Cell::new(Motion::Still),
         })
     }
@@ -2818,6 +2820,142 @@ impl Painter {
         }
 
         self.paint_media_controls(t, factory, cfg, body, now.playing, alpha);
+        self.paint_volume_control(t, factory, cfg, body, &now, alpha);
+    }
+
+    /// Output volume: a speaker button that toggles mute, and a track beside
+    /// it that is dragged to set the level.
+    ///
+    /// Both are always drawn. An earlier version hid the track until the
+    /// speaker was clicked, which gave one control two meanings depending on
+    /// invisible state — the first click revealed, every later one muted — and
+    /// no way back. The slide has the width for both (the transport row spans
+    /// ~68px of a ~708px body), so there was nothing to buy by hiding it.
+    ///
+    /// Drawn from the same primitives as the transport glyphs, and from the
+    /// same geometry functions the window hit-tests, so the two can never
+    /// disagree about where anything is.
+    ///
+    /// Nothing is drawn when there is no output device. That is the whole of
+    /// the unplugged-headphones case: no stale number, no dead control.
+    fn paint_volume_control(
+        &self,
+        t: &ID2D1DCRenderTarget,
+        factory: &windows::Win32::Graphics::Direct2D::ID2D1Factory,
+        cfg: &AppConfig,
+        body: D2D_RECT_F,
+        now: &NowPlaying,
+        alpha: f32,
+    ) {
+        if !now.has_volume {
+            return;
+        }
+        let Some((sx, sy, sr)) = crate::notch::geom::volume_speaker(body, now.has_volume) else {
+            return;
+        };
+
+        // Muted and unmuted have to be obviously different at a glance, not
+        // two shades of the same grey. Unmuted takes the accent colour, which
+        // is what every other "this is live" control on the slide already uses;
+        // muted drops to the faint tone and gains a slash.
+        //
+        // `shows_muted` also covers a level of zero, so the glyph stops
+        // claiming an audible output the hardware is not producing.
+        let glyph = if now.volume.shows_muted() {
+            theme::fade(self.pal.text_lo, alpha)
+        } else {
+            theme::fade(cfg.notch.accent, alpha)
+        };
+        self.speaker_icon(t, factory, (sx, sy, sr), glyph);
+        if now.volume.shows_muted() {
+            // A slash across the cone: the one universally understood mute mark,
+            // and legible at 22 px where a small icon's shape alone is not.
+            let s = sr * 0.62;
+            self.line(
+                t,
+                sx - s * 0.95,
+                sy + s * 0.85,
+                sx + s * 0.55,
+                sy - s * 0.85,
+                1.8,
+                theme::fade(self.pal.text_lo, alpha),
+            );
+        }
+
+        let track = crate::notch::geom::volume_track(body);
+        let accent = theme::fade(cfg.notch.accent, alpha);
+        let well = theme::fade(self.pal.well, alpha * 1.6);
+
+        self.fill_rrect(t, track, 2.0, well);
+
+        // `effective_level` folds mute into the fill, so a muted system shows an
+        // empty track rather than claiming to be at whatever scalar it holds.
+        let filled = now.volume.effective_level().clamp(0.0, 1.0);
+        if filled > 0.0 {
+            let fill = D2D_RECT_F {
+                right: track.left + (track.right - track.left) * filled,
+                ..track
+            };
+            self.fill_rrect(
+                t,
+                fill,
+                2.0,
+                if now.volume.shows_muted() {
+                    glyph
+                } else {
+                    accent
+                },
+            );
+        }
+
+        // Handle, so the current level is findable at a glance and the drag has
+        // something to look like it is holding.
+        let hx = track.left + (track.right - track.left) * filled;
+        self.dot(t, hx, (track.top + track.bottom) * 0.5, 4.5, accent);
+    }
+
+    /// Speaker glyph: a cone plus one or two arcs, built from the primitives
+    /// already used by the transport icons.
+    fn speaker_icon(
+        &self,
+        t: &ID2D1DCRenderTarget,
+        factory: &windows::Win32::Graphics::Direct2D::ID2D1Factory,
+        (cx, cy, r): (f32, f32, f32),
+        color: Rgba,
+    ) {
+        let s = r * 0.62;
+        // Cone: a small box at the left, opening into a triangle.
+        let box_w = s * 0.34;
+        self.fill_rrect(
+            t,
+            D2D_RECT_F {
+                left: cx - s * 0.95,
+                top: cy - s * 0.38,
+                right: cx - s * 0.95 + box_w,
+                bottom: cy + s * 0.38,
+            },
+            box_w * 0.3,
+            color,
+        );
+        self.fill_triangle(
+            t,
+            factory,
+            [
+                D2D_POINT_2F {
+                    x: cx - s * 0.61,
+                    y: cy - s * 0.38,
+                },
+                D2D_POINT_2F {
+                    x: cx - s * 0.61,
+                    y: cy + s * 0.38,
+                },
+                D2D_POINT_2F {
+                    x: cx + s * 0.15,
+                    y: cy,
+                },
+            ],
+            color,
+        );
     }
 
     /// Three transport buttons — previous, play/pause, next — drawn as

@@ -86,7 +86,9 @@ pub fn setup_custom_fonts(ctx: &egui::Context) {
 
     fonts.font_data.insert(
         "PlusJakartaSans".to_owned(),
-        egui::FontData::from_static(include_bytes!("../../PlusJakartaSans.ttf")),
+        std::sync::Arc::new(egui::FontData::from_static(include_bytes!(
+            "../../PlusJakartaSans.ttf"
+        ))),
     );
 
     fonts
@@ -153,6 +155,19 @@ struct PageCtx<'a> {
     changed: &'a mut bool,
     temp_text: &'a mut String,
     preview: &'a mut wallpaper::PreviewCache,
+    /// Text typed into the "add application" box, and the reason the last
+    /// attempt was refused. Live here rather than in a local so the field
+    /// keeps its contents across frames and a rejected entry stays put.
+    new_app_name: &'a mut String,
+    new_app_error: &'a mut Option<String>,
+    new_source_exe: &'a mut String,
+    new_source_kind: &'a mut crate::config::SourceKind,
+    /// Set when a disable was refused because it would empty the allowlist.
+    ///
+    /// Lives here rather than in a local for the same reason as
+    /// `new_app_error`: a local is rebuilt every frame, so the explanation
+    /// would flash for one frame and never be readable.
+    allow_toggle_notice: &'a mut Option<String>,
 }
 
 /// The rail, top to bottom. Order here is order on screen.
@@ -273,7 +288,33 @@ pub struct SettingsApp {
     /// Whether the window is on screen. Venu is a tray app: most of the time
     /// this is false, and a hidden window has nothing worth redrawing.
     on_screen: bool,
+    /// Text typed into the "add application" box. Lives on the app rather than
+    /// in a page function's local so the field keeps its contents between
+    /// frames and a rejected entry stays put for another try.
+    new_app_name: String,
+    /// Why the last add attempt was refused, shown under the input.
+    new_app_error: Option<String>,
+    /// Executable typed or Browse-picked for a Windows-application source.
+    /// Kept on the app rather than in a local so the field survives redraws
+    /// and stays put after a rejected attempt.
+    new_source_exe: String,
+    /// Which kind the Add flow is currently set to register.
+    new_source_kind: crate::config::SourceKind,
+    /// Set when a disable was refused because it would empty the allowlist.
+    ///
+    /// Stored on the app, not in a page local: a local is rebuilt every
+    /// frame, so the explanation would flash for one frame and never be
+    /// readable.
+    allow_toggle_notice: Option<String>,
 }
+
+/// Shown when a source cannot be disabled because it is the last one allowed.
+///
+/// An empty allowlist means "every source", so the final switch-off is
+/// refused rather than allowed to silently flip the whole registry back on.
+const ALLOWLIST_LAST_SOURCE_NOTICE: &str =
+    "An empty allowlist means \"all sources\", so at least one must stay enabled. \
+     Remove the source instead if you want it gone.";
 
 /// A strong ease-out — the same shape as `cubic-bezier(0.23, 1, 0.32, 1)`.
 ///
@@ -323,7 +364,7 @@ impl SettingsApp {
         setup_custom_fonts(&cc.egui_ctx);
 
         let mut style = (*cc.egui_ctx.style()).clone();
-        style.visuals.window_rounding = Rounding::same(10.0);
+        style.visuals.window_corner_radius = Rounding::same(10);
         style.spacing.item_spacing = Vec2::new(8.0, 8.0);
         style.spacing.button_padding = Vec2::new(12.0, 6.0);
         cc.egui_ctx.set_style(style);
@@ -338,6 +379,11 @@ impl SettingsApp {
             palette: None,
             preview: wallpaper::PreviewCache::new(),
             on_screen,
+            new_app_name: String::new(),
+            new_app_error: None,
+            new_source_exe: String::new(),
+            new_source_kind: Default::default(),
+            allow_toggle_notice: None,
         }
     }
 
@@ -426,7 +472,7 @@ impl SettingsApp {
                 if hover > 0.001 {
                     ui.painter().rect_filled(
                         rect,
-                        Rounding::same(8.0),
+                        Rounding::same(8),
                         theme::surface_hover().gamma_multiply(hover),
                     );
                 }
@@ -474,7 +520,7 @@ impl SettingsApp {
 
             ui.painter().set(
                 pill,
-                egui::Shape::rect_filled(moved, Rounding::same(8.0), theme::accent_wash()),
+                egui::Shape::rect_filled(moved, Rounding::same(8), theme::accent_wash()),
             );
             ui.painter().set(
                 bar,
@@ -483,7 +529,7 @@ impl SettingsApp {
                         moved.left_top() + Vec2::new(0.0, 7.0),
                         Vec2::new(2.5, moved.height() - 14.0),
                     ),
-                    Rounding::same(2.0),
+                    Rounding::same(2),
                     theme::accent(),
                 ),
             );
@@ -554,7 +600,7 @@ impl SettingsApp {
     }
 
     fn page_notch_notifications(ui: &mut egui::Ui, cx: &mut PageCtx<'_>) {
-        Self::sec_notch_notifications(ui, cx.cfg, cx.changed);
+        Self::sec_notch_notifications(ui, cx);
     }
 
     fn page_edge_overview(ui: &mut egui::Ui, cx: &mut PageCtx<'_>) {
@@ -709,22 +755,19 @@ impl SettingsApp {
 
         ui.painter().rect_filled(
             rect,
-            Rounding::same(8.0),
+            Rounding::same(8),
             theme::surface().gamma_multiply(1.0 - lit),
         );
         if hover > 0.001 {
             ui.painter().rect_filled(
                 rect,
-                Rounding::same(8.0),
+                Rounding::same(8),
                 theme::surface_hover().gamma_multiply(hover),
             );
         }
         if lit > 0.001 {
-            ui.painter().rect_filled(
-                rect,
-                Rounding::same(8.0),
-                theme::accent().gamma_multiply(lit),
-            );
+            ui.painter()
+                .rect_filled(rect, Rounding::same(8), theme::accent().gamma_multiply(lit));
         }
 
         let text = if lit > 0.5 {
@@ -772,8 +815,8 @@ impl SettingsApp {
 
             Frame::default()
                 .fill(bg_color)
-                .rounding(Rounding::same(6.0))
-                .inner_margin(Margin::symmetric(14.0, 6.0))
+                .rounding(Rounding::same(6))
+                .inner_margin(Margin::symmetric(14, 6))
                 .show(ui, |ui| {
                     ui.set_clip_rect(ui.max_rect());
                     let spacing_str = " ".repeat(cfg.phrase_spacing as usize);
@@ -1897,7 +1940,135 @@ impl SettingsApp {
         );
     }
 
-    fn sec_notch_notifications(ui: &mut egui::Ui, cfg: &mut AppConfig, changed: &mut bool) {
+    /// The "add application" row: a name box and an Add button.
+    ///
+    /// Rejections are explained rather than swallowed, because the registry
+    /// silently ignores an invalid or duplicate name otherwise and the user
+    /// would have no idea why nothing happened.
+    /// The "Add Notification Source" flow.
+    ///
+    /// Two kinds, chosen explicitly rather than guessed: a custom source is a
+    /// bare name for anything that is not a Windows executable, and a Windows
+    /// application additionally records an executable the user picks by hand.
+    /// Nothing here scans the system -- the Browse dialog is the only way an
+    /// executable enters the config, and it runs only when clicked.
+    fn source_add_field(
+        ui: &mut egui::Ui,
+        cfg: &mut AppConfig,
+        changed: &mut bool,
+        name_field: &mut String,
+        exe_field: &mut String,
+        error: &mut Option<String>,
+        kind: &mut crate::config::SourceKind,
+    ) {
+        use crate::config::SourceKind;
+
+        // Which kind the user is adding. Deliberately a visible choice: a
+        // source named `flash` is legitimate, but only once it is clear it is
+        // a custom source rather than a real application.
+        ui.horizontal(|ui| {
+            ui.label(
+                RichText::new("Add notification source")
+                    .size(12.0)
+                    .color(theme::text_secondary()),
+            );
+            ui.selectable_value(kind, SourceKind::Custom, "Custom source");
+            ui.selectable_value(kind, SourceKind::WindowsApp, "Windows application");
+        });
+        ui.add_space(4.0);
+
+        ui.horizontal(|ui| {
+            let response = ui.add(
+                egui::TextEdit::singleline(name_field)
+                    .hint_text("Source name")
+                    .desired_width(180.0),
+            );
+
+            // Enter submits, so the common case needs no mouse.
+            let submitted = response.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+
+            // A Windows application needs the executable as well as the name.
+            // The path is a label for the user: it is stored exactly as
+            // picked, never canonicalized, and never checked again.
+            let exe = if *kind == SourceKind::WindowsApp {
+                let picked = ui.add(
+                    egui::TextEdit::singleline(exe_field)
+                        .hint_text("Executable (optional)")
+                        .desired_width(240.0),
+                );
+                if ui.button("Browse...").clicked() {
+                    if let Some(path) =
+                        crate::gui::filedlg::pick_executable(exe_field, "Select an application")
+                    {
+                        *exe_field = path;
+                    }
+                }
+                let _ = picked;
+                Some(exe_field.trim().to_string())
+            } else {
+                None
+            };
+
+            if ui.button("Add").clicked() || submitted {
+                if name_field.trim().is_empty() {
+                    *error = Some("Enter a source name.".to_string());
+                } else if cfg
+                    .notch
+                    .notifications
+                    .add_source(&*name_field, *kind, exe.as_deref())
+                {
+                    // The webhook keeps its own copy of the allowlist, so it
+                    // has to learn about the new source immediately. It is
+                    // told the name and nothing else -- the executable is not
+                    // part of matching.
+                    crate::notch::notify::update_server_allowed_apps(
+                        cfg.notch.notifications.allowed_apps.clone(),
+                    );
+                    name_field.clear();
+                    exe_field.clear();
+                    *error = None;
+                    *changed = true;
+                } else {
+                    *error = Some(match name_field.trim().len() {
+                        0 => "Enter a source name.".to_string(),
+                        n if n > crate::config::NotificationConfig::MAX_APP_NAME_LEN => {
+                            format!(
+                                "Name is too long (max {} characters).",
+                                crate::config::NotificationConfig::MAX_APP_NAME_LEN
+                            )
+                        }
+                        _ => "That source is already in the list.".to_string(),
+                    });
+                }
+            }
+        });
+
+        if *kind == SourceKind::WindowsApp {
+            ui.label(
+                RichText::new(
+                    "The executable is only a label. Notifications are matched by source name, \
+                     and Venu never checks that the file still exists.",
+                )
+                .size(11.0)
+                .color(theme::text_tertiary()),
+            );
+        }
+
+        if let Some(error) = &*error {
+            ui.label(
+                RichText::new(error)
+                    .size(11.0)
+                    .color(theme::text_secondary()),
+            );
+        }
+    }
+
+    fn sec_notch_notifications(ui: &mut egui::Ui, cx: &mut PageCtx<'_>) {
+        // Reborrow rather than move, so `cx` stays usable for the add field
+        // further down.
+        let cfg: &mut AppConfig = cx.cfg;
+        let changed: &mut bool = cx.changed;
+
         Self::section_title(ui, "DYNAMIC NOTIFICATIONS");
 
         if ui
@@ -1930,51 +2101,59 @@ impl SettingsApp {
         );
         ui.add_space(8.0);
 
-        let presets = [
-            "Antigravity",
-            "Codex",
-            "Claude",
-            "Cursor",
-            "Terminal",
-            "VS Code",
-            "Slack",
-            "Discord",
-        ];
+        Self::source_add_field(
+            ui,
+            cfg,
+            changed,
+            cx.new_app_name,
+            cx.new_source_exe,
+            cx.new_app_error,
+            cx.new_source_kind,
+        );
 
+        ui.add_space(8.0);
+
+        let registry = cfg.notch.notifications.registry_entries();
         ui.horizontal_wrapped(|ui| {
-            for preset in presets {
-                let is_allowed = cfg
-                    .notch
-                    .notifications
-                    .allowed_apps
-                    .iter()
-                    .any(|a| a.eq_ignore_ascii_case(preset));
-                if ui.selectable_label(is_allowed, preset).clicked() {
-                    if is_allowed {
-                        cfg.notch
-                            .notifications
-                            .allowed_apps
-                            .retain(|a| !a.eq_ignore_ascii_case(preset));
+            for entry in &registry {
+                let app = &entry.name;
+                let is_allowed = entry.allowed;
+                if ui.selectable_label(is_allowed, app).clicked() {
+                    // Turning off the only remaining source would empty the
+                    // allowlist, which means "allow everything" -- so the
+                    // refusal has to reach the user instead of leaving the
+                    // chip silently flipped back on.
+                    if cfg.notch.notifications.set_app_allowed(app, !is_allowed) {
+                        crate::notch::notify::update_server_allowed_apps(
+                            cfg.notch.notifications.allowed_apps.clone(),
+                        );
+                        *cx.allow_toggle_notice = None;
+                        *changed = true;
                     } else {
-                        cfg.notch
-                            .notifications
-                            .allowed_apps
-                            .push(preset.to_string());
+                        *cx.allow_toggle_notice = Some(ALLOWLIST_LAST_SOURCE_NOTICE.to_string());
                     }
-                    crate::notch::notify::update_server_allowed_apps(
-                        cfg.notch.notifications.allowed_apps.clone(),
-                    );
-                    *changed = true;
                 }
             }
         });
+
+        if let Some(notice) = &*cx.allow_toggle_notice {
+            ui.label(RichText::new(notice).size(11.0).color(theme::accent()));
+        }
+
+        if registry.is_empty() {
+            ui.label(
+                RichText::new("No sources yet. Add one above to start receiving alerts.")
+                    .size(11.0)
+                    .color(theme::text_tertiary()),
+            );
+        }
 
         ui.add_space(10.0);
         ui.label(
             RichText::new(format!(
                 "Active whitelist: {}",
                 if cfg.notch.notifications.allowed_apps.is_empty() {
-                    "All apps allowed (whitelist empty)".to_string()
+                    "All sources allowed (whitelist empty)".to_string()
                 } else {
                     cfg.notch.notifications.allowed_apps.join(", ")
                 }
@@ -2033,40 +2212,87 @@ impl SettingsApp {
         Self::section_title(ui, "PROGRAM COLORS");
 
         ui.label(
-            RichText::new("Custom glowing badge & border colors for each application:")
+            RichText::new("Custom glowing badge & border colors for each source:")
                 .size(12.0)
                 .color(theme::text_secondary()),
         );
         ui.add_space(6.0);
 
-        let app_list = [
-            "Antigravity",
-            "Codex",
-            "Claude",
-            "Cursor",
-            "Terminal",
-            "VS Code",
-            "Slack",
-            "Discord",
-        ];
-        for app in app_list {
+        let registry = cfg.notch.notifications.registry_entries();
+        for entry in &registry {
+            let app = &entry.name;
             let mut current_color = cfg.notch.notifications.get_app_color(app);
+            let mut enabled = entry.allowed;
+
             ui.horizontal(|ui| {
                 ui.label(RichText::new(app).size(13.0).color(theme::text_primary()));
+
+                if ui
+                    .checkbox(&mut enabled, "")
+                    .on_hover_text("Allow this source to raise notification toasts")
+                    .changed()
+                {
+                    // Same guard as the chip row: the last source cannot be
+                    // switched off, or the empty allowlist would read as
+                    // "all allowed" and switch everything back on.
+                    if cfg.notch.notifications.set_app_allowed(app, enabled) {
+                        crate::notch::notify::update_server_allowed_apps(
+                            cfg.notch.notifications.allowed_apps.clone(),
+                        );
+                        *changed = true;
+                    } else {
+                        // Snap the checkbox back and say why.
+                        enabled = entry.allowed;
+                        *cx.allow_toggle_notice = Some(ALLOWLIST_LAST_SOURCE_NOTICE.to_string());
+                    }
+                }
+
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if ui.button("✕").on_hover_text("Remove this source").clicked() {
+                        cfg.notch.notifications.remove_app(app);
+                        crate::notch::notify::update_server_allowed_apps(
+                            cfg.notch.notifications.allowed_apps.clone(),
+                        );
+                        *changed = true;
+                    }
+
                     if ui
                         .color_edit_button_rgba_unmultiplied(&mut current_color)
                         .changed()
                     {
+                        // Preserve the casing the user chose rather than
+                        // writing whatever key happened to match.
+                        let key = cfg
+                            .notch
+                            .notifications
+                            .app_colors
+                            .keys()
+                            .find(|k| k.eq_ignore_ascii_case(app))
+                            .cloned()
+                            .unwrap_or_else(|| app.clone());
                         cfg.notch
                             .notifications
                             .app_colors
-                            .insert(app.to_string(), current_color);
+                            .insert(key, current_color);
                         *changed = true;
                     }
                 });
             });
+
+            // A Windows application carries the executable the user picked,
+            // shown read-only. It is a label for their benefit: nothing
+            // re-reads it, and it has no say in whether a notification is
+            // allowed.
+            if entry.kind == crate::config::SourceKind::WindowsApp {
+                if let Some(exe) = &entry.exe {
+                    ui.label(RichText::new(exe).size(11.0).color(theme::text_tertiary()));
+                }
+            }
             ui.add_space(2.0);
+        }
+
+        if let Some(notice) = &*cx.allow_toggle_notice {
+            ui.label(RichText::new(notice).size(11.0).color(theme::accent()));
         }
 
         Self::divider(ui);
@@ -2725,7 +2951,12 @@ impl SettingsApp {
 }
 
 impl eframe::App for SettingsApp {
-    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+    fn ui(&mut self, root_ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        // 0.34 hands the root `Ui` to the app instead of a `Context`. Panels
+        // still take a `Context`, and everything below was written against
+        // one, so derive it rather than restructuring the layout code.
+        let ctx = root_ui.ctx();
+
         if SETTINGS_HWND.load(std::sync::atomic::Ordering::Relaxed) == 0 {
             unsafe {
                 let _ = find_settings_hwnd();
@@ -2733,7 +2964,10 @@ impl eframe::App for SettingsApp {
         }
 
         if ctx.input(|i| i.viewport().close_requested()) {
-            // Closing puts Venu back in the tray rather than ending it.
+            // Closing puts Venu back in the tray rather than ending it. The
+            // window is simply hidden: eframe 0.34 does not busy-wait a core
+            // for a redraw that cannot arrive while a window is hidden, so the
+            // 1x1 off-screen parking that eframe 0.29 needed is gone.
             ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
             ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
             self.on_screen = false;
@@ -2776,7 +3010,7 @@ impl eframe::App for SettingsApp {
             .frame(
                 Frame::default()
                     .fill(theme::bg())
-                    .inner_margin(Margin::symmetric(24.0, 14.0)),
+                    .inner_margin(Margin::symmetric(24, 14)),
             )
             .show(ctx, |ui| {
                 ui.horizontal(|ui| {
@@ -2845,7 +3079,7 @@ impl eframe::App for SettingsApp {
                 .frame(
                     Frame::default()
                         .fill(theme::bg())
-                        .inner_margin(Margin::symmetric(24.0, 8.0)),
+                        .inner_margin(Margin::symmetric(24, 8)),
                 )
                 .show(ctx, |ui| {
                     ui.set_clip_rect(ui.max_rect());
@@ -2866,7 +3100,7 @@ impl eframe::App for SettingsApp {
             .frame(
                 Frame::default()
                     .fill(theme::sidebar())
-                    .inner_margin(Margin::symmetric(12.0, 16.0)),
+                    .inner_margin(Margin::symmetric(12, 16)),
             )
             .show(ctx, |ui| {
                 let before = self.active;
@@ -2900,10 +3134,13 @@ impl eframe::App for SettingsApp {
 
         egui::CentralPanel::default()
             .frame(Frame::default().fill(theme::bg()).inner_margin(Margin {
-                left: gutter + shift,
-                right: (gutter - shift).max(0.0),
-                top: 22.0,
-                bottom: 24.0,
+                // 0.34's Margin is i8, so the slide offset is quantised to whole
+                // pixels. The slide is 24px of travel, so it still reads as a
+                // slide, just without sub-pixel smoothness.
+                left: (gutter + shift).round() as i8,
+                right: (gutter - shift).max(0.0).round() as i8,
+                top: 22,
+                bottom: 24,
             }))
             .show(ctx, |ui| {
                 egui::ScrollArea::vertical()
@@ -2922,6 +3159,11 @@ impl eframe::App for SettingsApp {
                             changed: &mut config_changed,
                             temp_text: &mut self.temp_text,
                             preview: &mut self.preview,
+                            new_app_name: &mut self.new_app_name,
+                            new_app_error: &mut self.new_app_error,
+                            new_source_exe: &mut self.new_source_exe,
+                            new_source_kind: &mut self.new_source_kind,
+                            allow_toggle_notice: &mut self.allow_toggle_notice,
                         };
                         (page.draw)(ui, &mut cx);
                     });
@@ -2969,7 +3211,12 @@ fn paint_sidebar_hugeicon(
         (Group::Notch, "Overview") => {
             // Hugeicons: Notch Capsule Dashboard
             let rect = egui::Rect::from_center_size(center, egui::vec2(13.0, 7.0));
-            painter.rect_stroke(rect, egui::Rounding::same(3.5), stroke);
+            painter.rect_stroke(
+                rect,
+                egui::Rounding::same(4),
+                stroke,
+                egui::epaint::StrokeKind::Middle,
+            );
             painter.circle_filled(center, 1.2, color);
         }
         (Group::Notch, "Slides") => {
@@ -2978,13 +3225,28 @@ fn paint_sidebar_hugeicon(
                 egui::Rect::from_center_size(center + egui::vec2(-1.5, -1.5), egui::vec2(9.5, 7.5));
             let r2 =
                 egui::Rect::from_center_size(center + egui::vec2(1.5, 1.5), egui::vec2(9.5, 7.5));
-            painter.rect_stroke(r1, egui::Rounding::same(2.0), stroke);
-            painter.rect_stroke(r2, egui::Rounding::same(2.0), stroke);
+            painter.rect_stroke(
+                r1,
+                egui::Rounding::same(2),
+                stroke,
+                egui::epaint::StrokeKind::Middle,
+            );
+            painter.rect_stroke(
+                r2,
+                egui::Rounding::same(2),
+                stroke,
+                egui::epaint::StrokeKind::Middle,
+            );
         }
         (Group::Notch, "Status") => {
             // Hugeicons: Checklist Task
             let rect = egui::Rect::from_center_size(center, egui::vec2(12.5, 12.5));
-            painter.rect_stroke(rect, egui::Rounding::same(3.0), stroke);
+            painter.rect_stroke(
+                rect,
+                egui::Rounding::same(3),
+                stroke,
+                egui::epaint::StrokeKind::Middle,
+            );
             painter.line_segment(
                 [egui::pos2(cx - 3.2, cy), egui::pos2(cx - 1.0, cy + 2.2)],
                 stroke,
@@ -3000,7 +3262,12 @@ fn paint_sidebar_hugeicon(
         (Group::Notch, "Wallpaper") => {
             // Hugeicons: Photo Frame
             let rect = egui::Rect::from_center_size(center, egui::vec2(13.0, 11.0));
-            painter.rect_stroke(rect, egui::Rounding::same(2.5), stroke);
+            painter.rect_stroke(
+                rect,
+                egui::Rounding::same(2),
+                stroke,
+                egui::epaint::StrokeKind::Middle,
+            );
             painter.line_segment(
                 [
                     egui::pos2(cx - 4.2, cy + 2.8),
@@ -3114,7 +3381,12 @@ fn paint_sidebar_hugeicon(
             // Hugeicons: Desktop Display Monitor
             let screen =
                 egui::Rect::from_center_size(center + egui::vec2(0.0, -1.2), egui::vec2(13.0, 9.0));
-            painter.rect_stroke(screen, egui::Rounding::same(2.0), stroke);
+            painter.rect_stroke(
+                screen,
+                egui::Rounding::same(2),
+                stroke,
+                egui::epaint::StrokeKind::Middle,
+            );
             painter.line_segment([egui::pos2(cx, cy + 3.3), egui::pos2(cx, cy + 5.2)], stroke);
             painter.line_segment(
                 [
@@ -3128,7 +3400,12 @@ fn paint_sidebar_hugeicon(
             // Hugeicons: Chat Message Bubble
             let bubble =
                 egui::Rect::from_center_size(center + egui::vec2(0.0, -0.8), egui::vec2(12.5, 9.5));
-            painter.rect_stroke(bubble, egui::Rounding::same(2.5), stroke);
+            painter.rect_stroke(
+                bubble,
+                egui::Rounding::same(2),
+                stroke,
+                egui::epaint::StrokeKind::Middle,
+            );
             painter.line_segment(
                 [
                     egui::pos2(cx - 3.2, cy - 0.8),

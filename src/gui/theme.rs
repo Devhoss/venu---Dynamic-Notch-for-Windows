@@ -197,7 +197,8 @@ pub fn apply_style(ctx: &egui::Context, pal: Palette) {
         &mut v.widgets.active,
         &mut v.widgets.open,
     ] {
-        w.rounding = Rounding::same(7.0);
+        // 0.34 turned `rounding` into a getter; the field is `corner_radius`.
+        w.corner_radius = Rounding::same(7);
         w.expansion = 0.0;
     }
 

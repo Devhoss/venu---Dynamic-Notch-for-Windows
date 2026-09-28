@@ -77,3 +77,68 @@ pub fn pick_image(initial: &str, title: &str) -> Option<String> {
         Some(path)
     }
 }
+
+/// Ask the user to pick a Windows application for a notification source.
+///
+/// The returned path is stored as chosen. Venu does not canonicalize it,
+/// check that it still exists, or watch the process -- it is a label that
+/// tells the user which application a source refers to. Delivery is decided
+/// by the source name and the allowlist, never by this path.
+///
+/// `OFN_FILEMUSTEXIST` still applies: the file has to be there at the moment
+/// the user picks it, which is the only existence check that ever happens.
+pub fn pick_executable(initial: &str, title: &str) -> Option<String> {
+    // Same dialog as `pick_image`, different filter. Scripts are offered
+    // alongside executables because a source is often a .bat or .cmd wrapper
+    // rather than a real binary, and "All files" stays available so a user is
+    // never blocked by the filter from naming something unusual.
+    let mut filter: Vec<u16> = Vec::new();
+    for part in [
+        "Applications (*.exe, *.bat, *.cmd, *.com)",
+        "*.exe;*.bat;*.cmd;*.com",
+        "All files (*.*)",
+        "*.*",
+    ] {
+        filter.extend(part.encode_utf16());
+        filter.push(0);
+    }
+    filter.push(0);
+
+    // The dialog writes the chosen path back into this buffer, so it has to
+    // be big enough for a long path and owned for the duration of the call.
+    let mut buffer = vec![0u16; 1024];
+    let trimmed = initial.trim();
+    if !trimmed.is_empty() && trimmed.len() < 1000 {
+        let src = wide(trimmed);
+        buffer[..src.len()].copy_from_slice(&src);
+    }
+
+    let title = wide(title);
+
+    let mut ofn = OPENFILENAMEW {
+        lStructSize: std::mem::size_of::<OPENFILENAMEW>() as u32,
+        lpstrFilter: PCWSTR(filter.as_ptr()),
+        nFilterIndex: 1,
+        lpstrFile: windows::core::PWSTR(buffer.as_mut_ptr()),
+        nMaxFile: buffer.len() as u32,
+        lpstrTitle: PCWSTR(title.as_ptr()),
+        // NOCHANGEDIR for the same reason as pick_image: this dialog runs on
+        // eframe's thread, and moving the process working directory would
+        // break every relative path Venu holds.
+        Flags: OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST | OFN_NOCHANGEDIR,
+        ..Default::default()
+    };
+
+    let ok = unsafe { GetOpenFileNameW(&mut ofn) };
+    if !ok.as_bool() {
+        return None;
+    }
+
+    let end = buffer.iter().position(|&c| c == 0).unwrap_or(buffer.len());
+    let path = String::from_utf16_lossy(&buffer[..end]);
+    if path.trim().is_empty() {
+        None
+    } else {
+        Some(path)
+    }
+}

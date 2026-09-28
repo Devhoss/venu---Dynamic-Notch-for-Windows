@@ -9,6 +9,7 @@
 //! * [`geom`]    — the silhouette and its path
 //! * [`hook`]    — the wheel hook, parked on its own thread
 //! * [`media`]   — the Now Playing poller, on its own thread
+//! * [`volume`]  — Core Audio output volume, read on the media poll cycle
 //! * [`theme`]   — colour and type tokens
 //! * [`text`]    — DirectWrite, including the bundled private fonts
 //! * [`surface`] — the Direct2D target behind the layered window
@@ -26,6 +27,7 @@ pub mod state;
 pub mod surface;
 pub mod text;
 pub mod theme;
+pub mod volume;
 pub mod window;
 
 use std::sync::Arc;
@@ -108,6 +110,20 @@ impl NotchManager {
             let mut cfg = self.config.write();
             window.tick(&mut cfg, dt)
         };
+
+        // Raising the Settings window happens here, with the lock released.
+        //
+        // `window.tick` runs while this thread holds the config write lock, and
+        // the foreground calls in `tray::restore_settings_window` are
+        // synchronous: they make the Settings window's thread service a message
+        // before returning. That thread takes the same config write lock at the
+        // top of its own update, so calling them under the lock closed a cycle
+        // -- the overlay thread waiting on the Settings thread, the Settings
+        // thread waiting on the lock the overlay thread held -- and the window
+        // hung as "Not Responding" until the app was killed.
+        if outcome.open_settings {
+            crate::tray::restore_settings_window();
+        }
 
         if outcome.config_dirty {
             self.save_countdown = Some(SAVE_DEBOUNCE);

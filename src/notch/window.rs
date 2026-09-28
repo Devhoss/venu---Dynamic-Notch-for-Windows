@@ -40,8 +40,8 @@ use windows::Win32::UI::WindowsAndMessaging::{
     SetForegroundWindow, SetWindowLongW, SetWindowPos, ShowWindow, UpdateLayeredWindow,
     GWL_EXSTYLE, HMENU, HWND_NOTOPMOST, HWND_TOPMOST, SM_CXSCREEN, SM_CYSCREEN, SWP_NOACTIVATE,
     SWP_NOSIZE, SWP_SHOWWINDOW, SW_SHOWNOACTIVATE, ULW_ALPHA, WM_CHAR, WM_KEYDOWN, WM_KILLFOCUS,
-    WM_LBUTTONDOWN, WM_NCHITTEST, WNDCLASSW, WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW,
-    WS_EX_TOPMOST, WS_EX_TRANSPARENT, WS_POPUP,
+    WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE, WM_NCHITTEST, WNDCLASSW, WS_EX_LAYERED,
+    WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_EX_TRANSPARENT, WS_POPUP,
 };
 
 use crate::config::{AppConfig, NotchAlign, NotchTheme, SlideKind};
@@ -109,6 +109,16 @@ static CLASS_REGISTERED: AtomicBool = AtomicBool::new(false);
 #[derive(Default)]
 struct InputBus {
     click: Option<(f32, f32)>,
+    /// Latest pointer position while the primary button is held, in the same
+    /// shape-relative space as `click`. Only meaningful during a drag: a move
+    /// with no button down is hover, which the shape hit-test already covers.
+    drag: Option<(f32, f32)>,
+    /// Set on button-up. Ends any drag in progress.
+    released: bool,
+    /// True between button-down and button-up. Lets `WM_MOUSEMOVE` tell a drag
+    /// from an ordinary hover without needing the `MK_*` modifier constants,
+    /// which live behind a Cargo feature this project does not otherwise use.
+    held: bool,
     chars: Vec<char>,
     commit: bool,
     cancel: bool,
@@ -289,6 +299,9 @@ struct FrameKey {
     clock: u64,
     /// Bumped by the media poller when what is playing actually changes.
     media: u64,
+    /// Whether a volume drag is in progress. Changes the picture, so it
+    /// belongs in the key.
+    volume_dragging: bool,
     /// Bumped by the notification centre on every change to it.
     notifications: u64,
 }
@@ -301,6 +314,10 @@ pub struct TickOutcome {
     /// this is false the overlay thread drops to a slow poll that watches for
     /// hover and input without drawing anything.
     pub animating: bool,
+    /// The Settings button was clicked. The overlay thread has to raise the
+    /// Settings window itself once it has dropped the config write lock -- see
+    /// `NotchManager::tick`.
+    pub open_settings: bool,
 }
 
 pub struct NotchWindow {
@@ -328,6 +345,9 @@ pub struct NotchWindow {
     last_motion: Motion,
     last_paint: Instant,
     z_asserted_at: Instant,
+    /// Set by the Settings button, consumed at the end of `tick`. See
+    /// `TickOutcome::open_settings`.
+    open_settings: bool,
 }
 
 unsafe impl Send for NotchWindow {}
@@ -404,6 +424,7 @@ impl NotchWindow {
             last_motion: Motion::Still,
             last_paint: Instant::now(),
             z_asserted_at: Instant::now(),
+            open_settings: false,
         })
     }
 
@@ -655,16 +676,20 @@ impl NotchWindow {
 
         let drained = with_input(|bus| {
             let click = bus.click.take();
+            let drag = bus.drag.take();
+            let released = std::mem::replace(&mut bus.released, false);
             let chars = std::mem::take(&mut bus.chars);
             let commit = std::mem::replace(&mut bus.commit, false);
             let cancel = std::mem::replace(&mut bus.cancel, false);
             let backspace = std::mem::replace(&mut bus.backspace, false);
             let lost_focus = std::mem::replace(&mut bus.lost_focus, false);
-            (click, chars, commit, cancel, backspace, lost_focus)
+            (
+                click, drag, released, chars, commit, cancel, backspace, lost_focus,
+            )
         })
-        .unwrap_or((None, Vec::new(), false, false, false, false));
+        .unwrap_or((None, None, false, Vec::new(), false, false, false, false));
 
-        let (click, chars, commit, cancel, backspace, lost_focus) = drained;
+        let (click, drag, released, chars, commit, cancel, backspace, lost_focus) = drained;
 
         if cfg.notch.scroll_to_switch && wheel != 0 && self.state.is_open() {
             // Wheel down walks forward through the deck, matching the way a
@@ -675,6 +700,10 @@ impl NotchWindow {
         if let Some((cx, cy)) = click {
             self.handle_click(cfg, cx, cy, shape);
         }
+
+        // Drag handling runs after the click so a press that lands on the
+        // slider starts dragging on the same frame it reveals the slider.
+        self.handle_volume_drag(cfg, shape, drag, released);
 
         if self.state.editing {
             if cancel || lost_focus {
@@ -786,6 +815,7 @@ impl NotchWindow {
             // still in flight — a spring, the marquee, a countdown — and the
             // next one should not be kept waiting.
             animating: changed || self.last_motion == Motion::Continuous,
+            open_settings: std::mem::take(&mut self.open_settings),
         }
     }
 
@@ -811,8 +841,45 @@ impl NotchWindow {
             capture_excluded: self.capture_excluded,
             clock: clock_key(),
             media: self.painter.media.revision(),
+            volume_dragging: self.state.volume_dragging,
             notifications: crate::notch::notify::global_store().read().revision(),
         }
+    }
+
+    /// Track the volume slider through a press-move-release gesture.
+    ///
+    /// Scoped to the Now Playing control on purpose: the notch has no general
+    /// drag model, and this is the one place that needs one. A drag that is
+    /// not in progress writes nothing at all, so a stray mouse-move over the
+    /// panel cannot change the user's volume.
+    fn handle_volume_drag(
+        &mut self,
+        cfg: &AppConfig,
+        shape: NotchShape,
+        drag: Option<(f32, f32)>,
+        released: bool,
+    ) {
+        if self.state.volume_dragging && released {
+            self.state.volume_dragging = false;
+            self.painter.media.end_drag();
+            return;
+        }
+        if !self.state.volume_dragging {
+            return;
+        }
+        let Some((x, _y)) = drag else {
+            return;
+        };
+
+        // Dragging stays tied to the volume control even if the cursor wanders
+        // off it, which is what makes the gesture feel like a slider rather
+        // than a series of clicks.
+        let body = crate::notch::geom::slide_body(shape);
+        let level = crate::notch::geom::volume_from_x(crate::notch::geom::volume_track(body), x);
+        self.state.volume_dragging = true;
+        self.painter.media.set_dragging(level);
+        // The value reaches Windows on the poller thread; see `set_volume`.
+        self.painter.media.set_volume(level);
     }
 
     fn handle_click(&mut self, cfg: &AppConfig, cx: f32, cy: f32, shape: NotchShape) {
@@ -836,11 +903,15 @@ impl NotchWindow {
             return;
         }
 
-        // Settings launcher button: opens the Settings panel
+        // Settings launcher button: opens the Settings panel.
+        // Raising the window is left to the overlay thread once it has dropped
+        // the config write lock -- see `NotchManager::tick`. Doing the Win32
+        // calls here would mean holding that lock across a synchronous
+        // cross-thread message to a window whose thread wants the same lock.
         let (sx, sy, sr) = shape.settings_button();
         let hit_s = sr + 5.0;
         if (cx - sx) * (cx - sx) + (cy - sy) * (cy - sy) <= hit_s * hit_s {
-            crate::tray::restore_settings_window();
+            self.open_settings = true;
             return;
         }
 
@@ -909,6 +980,35 @@ impl NotchWindow {
         // same squared-distance-plus-slop hit test as the pin button above.
         if *slide == crate::config::SlideKind::Media {
             let body = crate::notch::geom::slide_body(shape);
+            let has_volume = self.painter.media.snapshot().has_volume;
+
+            // The speaker does one thing: mute. It used to also be the
+            // reveal toggle, which meant its meaning depended on invisible
+            // state and there was no way back once the slider was out.
+            if let Some((vx, vy, vr)) = crate::notch::geom::volume_speaker(body, has_volume) {
+                let hit = vr + 6.0;
+                if (cx - vx) * (cx - vx) + (cy - vy) * (cy - vy) <= hit * hit {
+                    self.painter.media.toggle_mute();
+                    return;
+                }
+            }
+
+            // A press on the track starts a drag rather than jumping and
+            // stopping: the level follows the cursor from here.
+            let track = crate::notch::geom::volume_track(body);
+            let grab = 10.0; // vertical slop, so a 4 px line is still easy to hit
+            if cx >= track.left - grab
+                && cx <= track.right + grab
+                && cy >= track.top - grab
+                && cy <= track.bottom + grab
+            {
+                self.state.volume_dragging = true;
+                let level = crate::notch::geom::volume_from_x(track, cx);
+                self.painter.media.set_dragging(level);
+                self.painter.media.set_volume(level);
+                return;
+            }
+
             let buttons = crate::notch::geom::media_transport_buttons(body);
             for (i, (bx, by, br)) in buttons.into_iter().enumerate() {
                 let hit = br + 5.0;
@@ -1089,6 +1189,30 @@ impl NotchWindow {
                 with_input(|bus| {
                     let (ox, oy) = bus.client_offset;
                     bus.click = Some((x + ox, y + oy));
+                    bus.held = true;
+                });
+                LRESULT(0)
+            }
+
+            WM_MOUSEMOVE => {
+                // Only a move with the button down is a drag. The button state
+                // is remembered from `WM_LBUTTONDOWN` rather than read out of
+                // `wparam`, so this needs no extra Win32 feature.
+                if with_input(|bus| bus.held).unwrap_or(false) {
+                    let x = (lparam.0 & 0xFFFF) as i16 as f32;
+                    let y = ((lparam.0 >> 16) & 0xFFFF) as i16 as f32;
+                    with_input(|bus| {
+                        let (ox, oy) = bus.client_offset;
+                        bus.drag = Some((x + ox, y + oy));
+                    });
+                }
+                LRESULT(0)
+            }
+
+            WM_LBUTTONUP => {
+                with_input(|bus| {
+                    bus.released = true;
+                    bus.held = false;
                 });
                 LRESULT(0)
             }

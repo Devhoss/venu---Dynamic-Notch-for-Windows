@@ -49,6 +49,11 @@ pub struct NotchState {
     /// Currently inspected notification in Notification Center expanded slide.
     pub selected_notification_id: Option<u64>,
 
+    /// True while the user is dragging the Now Playing volume slider. Suppresses
+    /// the media poller's published level for the duration, so the 900 ms read
+    /// cannot snap the handle out from under the cursor.
+    pub volume_dragging: bool,
+
     /// Set when something the user changed needs writing back to disk.
     pub dirty: bool,
 
@@ -78,6 +83,7 @@ impl NotchState {
             marquee_offset: 0.0,
             elapsed: 0.0,
             selected_notification_id: None,
+            volume_dragging: false,
             dirty: false,
             click_through_flash: 0.0,
         }

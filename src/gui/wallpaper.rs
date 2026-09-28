@@ -117,7 +117,7 @@ pub fn preview(
     let (rect, response) =
         ui.allocate_exact_size(Vec2::new(width, height), Sense::click_and_drag());
     let painter = ui.painter_at(rect);
-    let rounding = Rounding::same(10.0);
+    let rounding = Rounding::same(10);
 
     painter.rect_filled(rect, rounding, Color32::from_rgb(18, 18, 23));
 
@@ -135,12 +135,17 @@ pub fn preview(
         // gets the panel's rounded corners instead of square ones.
         painter.add(egui::Shape::Rect(egui::epaint::RectShape {
             rect,
-            rounding,
+            corner_radius: rounding,
             fill: Color32::WHITE,
             stroke: Stroke::NONE,
+            stroke_kind: egui::epaint::StrokeKind::Inside,
+            round_to_pixels: None,
             blur_width: 0.0,
-            fill_texture_id: id,
-            uv,
+            brush: Some(std::sync::Arc::new(egui::epaint::Brush {
+                fill_texture_id: id,
+                uv,
+            })),
+            angle: 0.0,
         }));
 
         if response.dragged() {
@@ -196,6 +201,8 @@ pub fn preview(
         rect,
         rounding,
         Stroke::new(1.0, Color32::from_rgb(48, 48, 56)),
+        // 0.29 had no stroke_kind and always centred the stroke on the path.
+        egui::epaint::StrokeKind::Middle,
     );
 
     if response.hovered() && src.is_some() {
