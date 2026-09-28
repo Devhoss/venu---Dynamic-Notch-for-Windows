@@ -160,6 +160,8 @@ struct PageCtx<'a> {
     /// keeps its contents across frames and a rejected entry stays put.
     new_app_name: &'a mut String,
     new_app_error: &'a mut Option<String>,
+    new_source_exe: &'a mut String,
+    new_source_kind: &'a mut crate::config::SourceKind,
 }
 
 /// The rail, top to bottom. Order here is order on screen.
@@ -286,6 +288,12 @@ pub struct SettingsApp {
     new_app_name: String,
     /// Why the last add attempt was refused, shown under the input.
     new_app_error: Option<String>,
+    /// Executable typed or Browse-picked for a Windows-application source.
+    /// Kept on the app rather than in a local so the field survives redraws
+    /// and stays put after a rejected attempt.
+    new_source_exe: String,
+    /// Which kind the Add flow is currently set to register.
+    new_source_kind: crate::config::SourceKind,
 }
 
 /// A strong ease-out — the same shape as `cubic-bezier(0.23, 1, 0.32, 1)`.
@@ -353,6 +361,8 @@ impl SettingsApp {
             on_screen,
             new_app_name: String::new(),
             new_app_error: None,
+            new_source_exe: String::new(),
+            new_source_kind: Default::default(),
         }
     }
 
@@ -1914,49 +1924,114 @@ impl SettingsApp {
     /// Rejections are explained rather than swallowed, because the registry
     /// silently ignores an invalid or duplicate name otherwise and the user
     /// would have no idea why nothing happened.
-    fn app_add_field(
+    /// The "Add Notification Source" flow.
+    ///
+    /// Two kinds, chosen explicitly rather than guessed: a custom source is a
+    /// bare name for anything that is not a Windows executable, and a Windows
+    /// application additionally records an executable the user picks by hand.
+    /// Nothing here scans the system -- the Browse dialog is the only way an
+    /// executable enters the config, and it runs only when clicked.
+    fn source_add_field(
         ui: &mut egui::Ui,
         cfg: &mut AppConfig,
         changed: &mut bool,
         name_field: &mut String,
+        exe_field: &mut String,
         error: &mut Option<String>,
+        kind: &mut crate::config::SourceKind,
     ) {
+        use crate::config::SourceKind;
+
+        // Which kind the user is adding. Deliberately a visible choice: a
+        // source named `flash` is legitimate, but only once it is clear it is
+        // a custom source rather than a real application.
+        ui.horizontal(|ui| {
+            ui.label(
+                RichText::new("Add notification source")
+                    .size(12.0)
+                    .color(theme::text_secondary()),
+            );
+            ui.selectable_value(kind, SourceKind::Custom, "Custom source");
+            ui.selectable_value(kind, SourceKind::WindowsApp, "Windows application");
+        });
+        ui.add_space(4.0);
+
         ui.horizontal(|ui| {
             let response = ui.add(
                 egui::TextEdit::singleline(name_field)
-                    .hint_text("Application name")
+                    .hint_text("Source name")
                     .desired_width(180.0),
             );
 
             // Enter submits, so the common case needs no mouse.
             let submitted = response.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
 
+            // A Windows application needs the executable as well as the name.
+            // The path is a label for the user: it is stored exactly as
+            // picked, never canonicalized, and never checked again.
+            let exe = if *kind == SourceKind::WindowsApp {
+                let picked = ui.add(
+                    egui::TextEdit::singleline(exe_field)
+                        .hint_text("Executable (optional)")
+                        .desired_width(240.0),
+                );
+                if ui.button("Browse...").clicked() {
+                    if let Some(path) =
+                        crate::gui::filedlg::pick_executable(exe_field, "Select an application")
+                    {
+                        *exe_field = path;
+                    }
+                }
+                let _ = picked;
+                Some(exe_field.trim().to_string())
+            } else {
+                None
+            };
+
             if ui.button("Add").clicked() || submitted {
                 if name_field.trim().is_empty() {
-                    *error = Some("Enter an application name.".to_string());
-                } else if cfg.notch.notifications.add_app(&*name_field) {
+                    *error = Some("Enter a source name.".to_string());
+                } else if cfg
+                    .notch
+                    .notifications
+                    .add_source(&*name_field, *kind, exe.as_deref())
+                {
                     // The webhook keeps its own copy of the allowlist, so it
-                    // has to learn about the new app immediately.
+                    // has to learn about the new source immediately. It is
+                    // told the name and nothing else -- the executable is not
+                    // part of matching.
                     crate::notch::notify::update_server_allowed_apps(
                         cfg.notch.notifications.allowed_apps.clone(),
                     );
                     name_field.clear();
+                    exe_field.clear();
                     *error = None;
                     *changed = true;
                 } else {
                     *error = Some(match name_field.trim().len() {
-                        0 => "Enter an application name.".to_string(),
+                        0 => "Enter a source name.".to_string(),
                         n if n > crate::config::NotificationConfig::MAX_APP_NAME_LEN => {
                             format!(
                                 "Name is too long (max {} characters).",
                                 crate::config::NotificationConfig::MAX_APP_NAME_LEN
                             )
                         }
-                        _ => "That application is already in the list.".to_string(),
+                        _ => "That source is already in the list.".to_string(),
                     });
                 }
             }
         });
+
+        if *kind == SourceKind::WindowsApp {
+            ui.label(
+                RichText::new(
+                    "The executable is only a label. Notifications are matched by source name, \
+                     and Venu never checks that the file still exists.",
+                )
+                .size(11.0)
+                .color(theme::text_tertiary()),
+            );
+        }
 
         if let Some(error) = &*error {
             ui.label(
@@ -2005,14 +2080,23 @@ impl SettingsApp {
         );
         ui.add_space(8.0);
 
-        Self::app_add_field(ui, cfg, changed, cx.new_app_name, cx.new_app_error);
+        Self::source_add_field(
+            ui,
+            cfg,
+            changed,
+            cx.new_app_name,
+            cx.new_source_exe,
+            cx.new_app_error,
+            cx.new_source_kind,
+        );
 
         ui.add_space(8.0);
 
-        let registry = cfg.notch.notifications.app_registry();
+        let registry = cfg.notch.notifications.registry_entries();
         ui.horizontal_wrapped(|ui| {
-            for app in &registry {
-                let is_allowed = cfg.notch.notifications.is_app_allowed(app);
+            for entry in &registry {
+                let app = &entry.name;
+                let is_allowed = entry.allowed;
                 if ui.selectable_label(is_allowed, app).clicked() {
                     cfg.notch.notifications.set_app_allowed(app, !is_allowed);
                     crate::notch::notify::update_server_allowed_apps(
@@ -2025,7 +2109,7 @@ impl SettingsApp {
 
         if registry.is_empty() {
             ui.label(
-                RichText::new("No applications yet. Add one above to start receiving alerts.")
+                RichText::new("No sources yet. Add one above to start receiving alerts.")
                     .size(11.0)
                     .color(theme::text_tertiary()),
             );
@@ -2036,7 +2120,7 @@ impl SettingsApp {
             RichText::new(format!(
                 "Active whitelist: {}",
                 if cfg.notch.notifications.allowed_apps.is_empty() {
-                    "All apps allowed (whitelist empty)".to_string()
+                    "All sources allowed (whitelist empty)".to_string()
                 } else {
                     cfg.notch.notifications.allowed_apps.join(", ")
                 }
@@ -2095,24 +2179,24 @@ impl SettingsApp {
         Self::section_title(ui, "PROGRAM COLORS");
 
         ui.label(
-            RichText::new("Custom glowing badge & border colors for each application:")
+            RichText::new("Custom glowing badge & border colors for each source:")
                 .size(12.0)
                 .color(theme::text_secondary()),
         );
         ui.add_space(6.0);
 
-        let registry = cfg.notch.notifications.app_registry();
-        for app in &registry {
+        let registry = cfg.notch.notifications.registry_entries();
+        for entry in &registry {
+            let app = &entry.name;
             let mut current_color = cfg.notch.notifications.get_app_color(app);
-            let is_allowed = cfg.notch.notifications.is_app_allowed(app);
-            let mut enabled = is_allowed;
+            let mut enabled = entry.allowed;
 
             ui.horizontal(|ui| {
                 ui.label(RichText::new(app).size(13.0).color(theme::text_primary()));
 
                 if ui
                     .checkbox(&mut enabled, "")
-                    .on_hover_text("Allow this app to raise notification toasts")
+                    .on_hover_text("Allow this source to raise notification toasts")
                     .changed()
                 {
                     cfg.notch.notifications.set_app_allowed(app, enabled);
@@ -2123,11 +2207,7 @@ impl SettingsApp {
                 }
 
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if ui
-                        .button("✕")
-                        .on_hover_text("Remove this application")
-                        .clicked()
-                    {
+                    if ui.button("✕").on_hover_text("Remove this source").clicked() {
                         cfg.notch.notifications.remove_app(app);
                         crate::notch::notify::update_server_allowed_apps(
                             cfg.notch.notifications.allowed_apps.clone(),
@@ -2157,6 +2237,16 @@ impl SettingsApp {
                     }
                 });
             });
+
+            // A Windows application carries the executable the user picked,
+            // shown read-only. It is a label for their benefit: nothing
+            // re-reads it, and it has no say in whether a notification is
+            // allowed.
+            if entry.kind == crate::config::SourceKind::WindowsApp {
+                if let Some(exe) = &entry.exe {
+                    ui.label(RichText::new(exe).size(11.0).color(theme::text_tertiary()));
+                }
+            }
             ui.add_space(2.0);
         }
 
@@ -3026,6 +3116,8 @@ impl eframe::App for SettingsApp {
                             preview: &mut self.preview,
                             new_app_name: &mut self.new_app_name,
                             new_app_error: &mut self.new_app_error,
+                            new_source_exe: &mut self.new_source_exe,
+                            new_source_kind: &mut self.new_source_kind,
                         };
                         (page.draw)(ui, &mut cx);
                     });
