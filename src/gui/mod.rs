@@ -86,7 +86,9 @@ pub fn setup_custom_fonts(ctx: &egui::Context) {
 
     fonts.font_data.insert(
         "PlusJakartaSans".to_owned(),
-        egui::FontData::from_static(include_bytes!("../../PlusJakartaSans.ttf")),
+        std::sync::Arc::new(egui::FontData::from_static(include_bytes!(
+            "../../PlusJakartaSans.ttf"
+        ))),
     );
 
     fonts
@@ -323,7 +325,7 @@ impl SettingsApp {
         setup_custom_fonts(&cc.egui_ctx);
 
         let mut style = (*cc.egui_ctx.style()).clone();
-        style.visuals.window_rounding = Rounding::same(10.0);
+        style.visuals.window_corner_radius = Rounding::same(10);
         style.spacing.item_spacing = Vec2::new(8.0, 8.0);
         style.spacing.button_padding = Vec2::new(12.0, 6.0);
         cc.egui_ctx.set_style(style);
@@ -426,7 +428,7 @@ impl SettingsApp {
                 if hover > 0.001 {
                     ui.painter().rect_filled(
                         rect,
-                        Rounding::same(8.0),
+                        Rounding::same(8),
                         theme::surface_hover().gamma_multiply(hover),
                     );
                 }
@@ -474,7 +476,7 @@ impl SettingsApp {
 
             ui.painter().set(
                 pill,
-                egui::Shape::rect_filled(moved, Rounding::same(8.0), theme::accent_wash()),
+                egui::Shape::rect_filled(moved, Rounding::same(8), theme::accent_wash()),
             );
             ui.painter().set(
                 bar,
@@ -483,7 +485,7 @@ impl SettingsApp {
                         moved.left_top() + Vec2::new(0.0, 7.0),
                         Vec2::new(2.5, moved.height() - 14.0),
                     ),
-                    Rounding::same(2.0),
+                    Rounding::same(2),
                     theme::accent(),
                 ),
             );
@@ -709,22 +711,19 @@ impl SettingsApp {
 
         ui.painter().rect_filled(
             rect,
-            Rounding::same(8.0),
+            Rounding::same(8),
             theme::surface().gamma_multiply(1.0 - lit),
         );
         if hover > 0.001 {
             ui.painter().rect_filled(
                 rect,
-                Rounding::same(8.0),
+                Rounding::same(8),
                 theme::surface_hover().gamma_multiply(hover),
             );
         }
         if lit > 0.001 {
-            ui.painter().rect_filled(
-                rect,
-                Rounding::same(8.0),
-                theme::accent().gamma_multiply(lit),
-            );
+            ui.painter()
+                .rect_filled(rect, Rounding::same(8), theme::accent().gamma_multiply(lit));
         }
 
         let text = if lit > 0.5 {
@@ -772,8 +771,8 @@ impl SettingsApp {
 
             Frame::default()
                 .fill(bg_color)
-                .rounding(Rounding::same(6.0))
-                .inner_margin(Margin::symmetric(14.0, 6.0))
+                .rounding(Rounding::same(6))
+                .inner_margin(Margin::symmetric(14, 6))
                 .show(ui, |ui| {
                     ui.set_clip_rect(ui.max_rect());
                     let spacing_str = " ".repeat(cfg.phrase_spacing as usize);
@@ -2725,7 +2724,12 @@ impl SettingsApp {
 }
 
 impl eframe::App for SettingsApp {
-    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+    fn ui(&mut self, root_ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        // 0.34 hands the root `Ui` to the app instead of a `Context`. Panels
+        // still take a `Context`, and everything below was written against
+        // one, so derive it rather than restructuring the layout code.
+        let ctx = root_ui.ctx();
+
         if SETTINGS_HWND.load(std::sync::atomic::Ordering::Relaxed) == 0 {
             unsafe {
                 let _ = find_settings_hwnd();
@@ -2733,7 +2737,10 @@ impl eframe::App for SettingsApp {
         }
 
         if ctx.input(|i| i.viewport().close_requested()) {
-            // Closing puts Venu back in the tray rather than ending it.
+            // Closing puts Venu back in the tray rather than ending it. The
+            // window is simply hidden: eframe 0.34 does not busy-wait a core
+            // for a redraw that cannot arrive while a window is hidden, so the
+            // 1x1 off-screen parking that eframe 0.29 needed is gone.
             ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
             ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
             self.on_screen = false;
@@ -2776,7 +2783,7 @@ impl eframe::App for SettingsApp {
             .frame(
                 Frame::default()
                     .fill(theme::bg())
-                    .inner_margin(Margin::symmetric(24.0, 14.0)),
+                    .inner_margin(Margin::symmetric(24, 14)),
             )
             .show(ctx, |ui| {
                 ui.horizontal(|ui| {
@@ -2845,7 +2852,7 @@ impl eframe::App for SettingsApp {
                 .frame(
                     Frame::default()
                         .fill(theme::bg())
-                        .inner_margin(Margin::symmetric(24.0, 8.0)),
+                        .inner_margin(Margin::symmetric(24, 8)),
                 )
                 .show(ctx, |ui| {
                     ui.set_clip_rect(ui.max_rect());
@@ -2866,7 +2873,7 @@ impl eframe::App for SettingsApp {
             .frame(
                 Frame::default()
                     .fill(theme::sidebar())
-                    .inner_margin(Margin::symmetric(12.0, 16.0)),
+                    .inner_margin(Margin::symmetric(12, 16)),
             )
             .show(ctx, |ui| {
                 let before = self.active;
@@ -2900,10 +2907,13 @@ impl eframe::App for SettingsApp {
 
         egui::CentralPanel::default()
             .frame(Frame::default().fill(theme::bg()).inner_margin(Margin {
-                left: gutter + shift,
-                right: (gutter - shift).max(0.0),
-                top: 22.0,
-                bottom: 24.0,
+                // 0.34's Margin is i8, so the slide offset is quantised to whole
+                // pixels. The slide is 24px of travel, so it still reads as a
+                // slide, just without sub-pixel smoothness.
+                left: (gutter + shift).round() as i8,
+                right: (gutter - shift).max(0.0).round() as i8,
+                top: 22,
+                bottom: 24,
             }))
             .show(ctx, |ui| {
                 egui::ScrollArea::vertical()
@@ -2969,7 +2979,12 @@ fn paint_sidebar_hugeicon(
         (Group::Notch, "Overview") => {
             // Hugeicons: Notch Capsule Dashboard
             let rect = egui::Rect::from_center_size(center, egui::vec2(13.0, 7.0));
-            painter.rect_stroke(rect, egui::Rounding::same(3.5), stroke);
+            painter.rect_stroke(
+                rect,
+                egui::Rounding::same(4),
+                stroke,
+                egui::epaint::StrokeKind::Middle,
+            );
             painter.circle_filled(center, 1.2, color);
         }
         (Group::Notch, "Slides") => {
@@ -2978,13 +2993,28 @@ fn paint_sidebar_hugeicon(
                 egui::Rect::from_center_size(center + egui::vec2(-1.5, -1.5), egui::vec2(9.5, 7.5));
             let r2 =
                 egui::Rect::from_center_size(center + egui::vec2(1.5, 1.5), egui::vec2(9.5, 7.5));
-            painter.rect_stroke(r1, egui::Rounding::same(2.0), stroke);
-            painter.rect_stroke(r2, egui::Rounding::same(2.0), stroke);
+            painter.rect_stroke(
+                r1,
+                egui::Rounding::same(2),
+                stroke,
+                egui::epaint::StrokeKind::Middle,
+            );
+            painter.rect_stroke(
+                r2,
+                egui::Rounding::same(2),
+                stroke,
+                egui::epaint::StrokeKind::Middle,
+            );
         }
         (Group::Notch, "Status") => {
             // Hugeicons: Checklist Task
             let rect = egui::Rect::from_center_size(center, egui::vec2(12.5, 12.5));
-            painter.rect_stroke(rect, egui::Rounding::same(3.0), stroke);
+            painter.rect_stroke(
+                rect,
+                egui::Rounding::same(3),
+                stroke,
+                egui::epaint::StrokeKind::Middle,
+            );
             painter.line_segment(
                 [egui::pos2(cx - 3.2, cy), egui::pos2(cx - 1.0, cy + 2.2)],
                 stroke,
@@ -3000,7 +3030,12 @@ fn paint_sidebar_hugeicon(
         (Group::Notch, "Wallpaper") => {
             // Hugeicons: Photo Frame
             let rect = egui::Rect::from_center_size(center, egui::vec2(13.0, 11.0));
-            painter.rect_stroke(rect, egui::Rounding::same(2.5), stroke);
+            painter.rect_stroke(
+                rect,
+                egui::Rounding::same(2),
+                stroke,
+                egui::epaint::StrokeKind::Middle,
+            );
             painter.line_segment(
                 [
                     egui::pos2(cx - 4.2, cy + 2.8),
@@ -3114,7 +3149,12 @@ fn paint_sidebar_hugeicon(
             // Hugeicons: Desktop Display Monitor
             let screen =
                 egui::Rect::from_center_size(center + egui::vec2(0.0, -1.2), egui::vec2(13.0, 9.0));
-            painter.rect_stroke(screen, egui::Rounding::same(2.0), stroke);
+            painter.rect_stroke(
+                screen,
+                egui::Rounding::same(2),
+                stroke,
+                egui::epaint::StrokeKind::Middle,
+            );
             painter.line_segment([egui::pos2(cx, cy + 3.3), egui::pos2(cx, cy + 5.2)], stroke);
             painter.line_segment(
                 [
@@ -3128,7 +3168,12 @@ fn paint_sidebar_hugeicon(
             // Hugeicons: Chat Message Bubble
             let bubble =
                 egui::Rect::from_center_size(center + egui::vec2(0.0, -0.8), egui::vec2(12.5, 9.5));
-            painter.rect_stroke(bubble, egui::Rounding::same(2.5), stroke);
+            painter.rect_stroke(
+                bubble,
+                egui::Rounding::same(2),
+                stroke,
+                egui::epaint::StrokeKind::Middle,
+            );
             painter.line_segment(
                 [
                     egui::pos2(cx - 3.2, cy - 0.8),

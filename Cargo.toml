@@ -6,8 +6,28 @@ description = "A sleek, hardware-accelerated Dynamic Notch for Windows with live
 license = "MIT"
 
 [dependencies]
-eframe = "0.29"
-egui = "0.29"
+# wgpu backend instead of the default glow/OpenGL one. `default` pulls in
+# `glow`, so it has to be switched off explicitly or both backends compile in.
+# Everything else in the default set is kept.
+eframe = { version = "0.34.3", default-features = false, features = [
+    "accesskit",
+    "default_fonts",
+    "wgpu",
+    "wayland",
+    "web_screen_reader",
+    "x11",
+] }
+egui = "0.34.3"
+# wgpu is not referenced anywhere in Venu's own source -- it is here to pin the
+# backend, so it has to be a version egui-wgpu 0.34.3 actually compiles against.
+# egui-wgpu resolves wgpu 29, but wgpu-hal 29 fails to build against the
+# `windows` 0.62 bindings that accesskit-winit pulls in (Param/InterfaceType
+# trait errors), so 30 is pinned instead. The dx12 backend stays off: it needs
+# gpu-allocator, and Venu's Direct2D code is written against windows 0.58.
+wgpu = { version = "30", default-features = false, features = [
+    "vulkan",
+    "wgsl",
+] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 dirs = "5.0"
