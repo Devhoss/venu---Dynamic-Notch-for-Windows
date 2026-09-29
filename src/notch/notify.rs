@@ -18,6 +18,11 @@ pub enum NotificationLevel {
     Success,
     Warning,
     Action,
+    /// A failure. Added because senders in the wild already emit `"error"` --
+    /// the Hermes session hook has always sent it -- and the enum used to stop
+    /// at `Action`, so those payloads failed to parse and the whole
+    /// notification was rejected with a 400.
+    Error,
 }
 
 impl Default for NotificationLevel {
@@ -34,6 +39,7 @@ impl NotificationLevel {
             Self::Success => [0.13, 0.85, 0.53, 1.0], // Emerald
             Self::Warning => [1.00, 0.65, 0.00, 1.0], // Amber
             Self::Action => [0.66, 0.33, 0.97, 1.0],  // Violet
+            Self::Error => [0.94, 0.27, 0.31, 1.0],   // Red
         }
     }
 }
@@ -222,8 +228,35 @@ pub struct WebhookPayload {
     pub title: Option<String>,
     pub body: Option<String>,
     pub message: Option<String>,
+    /// `level` is deliberately lenient: a level this build does not know about
+    /// falls back to `Info` instead of failing the whole payload. Previously an
+    /// unrecognised level made `serde` reject the entire document, so one
+    /// unknown enum name cost the caller their whole notification -- title,
+    /// body and all. Unknown *levels* are a forward-compatibility concern, but
+    /// unknown *shapes* are still rejected below.
+    #[serde(default, deserialize_with = "lenient_level")]
     pub level: Option<NotificationLevel>,
     pub duration: Option<f32>,
+}
+
+/// Deserialise a level without letting an unrecognised name fail the payload.
+fn lenient_level<'de, D>(de: D) -> Result<Option<NotificationLevel>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum Maybe {
+        Known(NotificationLevel),
+        /// Any other scalar or structure. Kept so `null`, a number, or a future
+        /// string variant still deserialises rather than erroring.
+        Other(serde::de::IgnoredAny),
+    }
+
+    match Option::<Maybe>::deserialize(de)? {
+        Some(Maybe::Known(level)) => Ok(Some(level)),
+        _ => Ok(None),
+    }
 }
 
 /// Latest known Claude Code usage snapshot, reported by the `statusLine` hook.
@@ -423,4 +456,119 @@ pub fn start_webhook_server(port: u16, initial_allowed: Vec<String>) {
             }
         })
         .ok();
+}
+
+#[cfg(test)]
+mod level_tests {
+    use super::*;
+
+    fn parse(raw: &str) -> Result<WebhookPayload, serde_json::Error> {
+        serde_json::from_str::<WebhookPayload>(raw)
+    }
+
+    /// The exact payload shape the Hermes session hook writes for a failed
+    /// session. It is the reason `Error` exists: this used to be rejected.
+    const HERMES_FAILURE: &str = r#"{
+        "app": "Hermes",
+        "title": "Task failed",
+        "body": "venu · coder · context_exceeded",
+        "level": "error",
+        "duration": 4.5
+    }"#;
+
+    #[test]
+    fn success_is_accepted() {
+        let p = parse(r#"{"app":"Hermes","level":"success"}"#).expect("success must parse");
+        assert_eq!(p.level, Some(NotificationLevel::Success));
+    }
+
+    #[test]
+    fn warning_is_accepted() {
+        let p = parse(r#"{"app":"Hermes","level":"warning"}"#).expect("warning must parse");
+        assert_eq!(p.level, Some(NotificationLevel::Warning));
+    }
+
+    #[test]
+    fn info_is_accepted() {
+        let p = parse(r#"{"app":"Hermes","level":"info"}"#).expect("info must parse");
+        assert_eq!(p.level, Some(NotificationLevel::Info));
+    }
+
+    #[test]
+    fn action_is_accepted() {
+        let p = parse(r#"{"app":"Hermes","level":"action"}"#).expect("action must parse");
+        assert_eq!(p.level, Some(NotificationLevel::Action));
+    }
+
+    #[test]
+    fn error_is_accepted() {
+        let p = parse(HERMES_FAILURE).expect("the Hermes failure payload must parse");
+
+        assert_eq!(p.level, Some(NotificationLevel::Error));
+        // The rest of the payload has to survive too -- this is the whole point.
+        assert_eq!(p.app.as_deref(), Some("Hermes"));
+        assert_eq!(p.title.as_deref(), Some("Task failed"));
+        assert_eq!(p.body.as_deref(), Some("venu · coder · context_exceeded"));
+        assert_eq!(p.duration, Some(4.5));
+    }
+
+    #[test]
+    fn a_missing_level_stays_none_and_defaults_at_the_call_site() {
+        let p = parse(r#"{"app":"Hermes","title":"No level"}"#).expect("must parse");
+        assert_eq!(p.level, None);
+        // Mirrors `payload.level.unwrap_or_default()` in the request handler.
+        assert_eq!(p.level.unwrap_or_default(), NotificationLevel::Info);
+    }
+
+    #[test]
+    fn an_unknown_level_degrades_to_info_without_losing_the_notification() {
+        // A level from a newer Venu build. Losing the whole notification to an
+        // unrecognised level name is the bug this leniency exists to prevent.
+        let p =
+            parse(r#"{"app":"Hermes","title":"From the future","body":"kept","level":"critical"}"#)
+                .expect("an unknown level must not fail the payload");
+
+        assert_eq!(p.level, None);
+        assert_eq!(p.title.as_deref(), Some("From the future"));
+        assert_eq!(p.body.as_deref(), Some("kept"));
+    }
+
+    #[test]
+    fn a_non_string_level_degrades_instead_of_erroring() {
+        for raw in [
+            r#"{"app":"Hermes","level":42}"#,
+            r#"{"app":"Hermes","level":null}"#,
+            r#"{"app":"Hermes","level":{"kind":"error"}}"#,
+            r#"{"app":"Hermes","level":["error"]}"#,
+        ] {
+            assert!(
+                parse(raw).is_ok(),
+                "a malformed level must not discard the notification: {raw}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_malformed_payload_shape_is_still_rejected() {
+        // Leniency applies to the level only. Structurally broken input is a
+        // sender bug and should still surface as a 400.
+        assert!(parse("{not json").is_err());
+        assert!(parse(r#"{"app":{"nested":true}}"#).is_err());
+        assert!(parse(r#"[1,2,3]"#).is_err());
+    }
+
+    #[test]
+    fn every_level_round_trips_through_serde() {
+        for level in [
+            NotificationLevel::Info,
+            NotificationLevel::Success,
+            NotificationLevel::Warning,
+            NotificationLevel::Action,
+            NotificationLevel::Error,
+        ] {
+            let json = serde_json::to_string(&level).expect("serialise");
+            let back: NotificationLevel = serde_json::from_str(&json).expect("deserialise");
+            assert_eq!(level, back, "{json} must round-trip");
+        }
+    }
 }
