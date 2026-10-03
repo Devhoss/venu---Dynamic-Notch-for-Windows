@@ -7,7 +7,7 @@
 use std::time::{Duration, Instant};
 
 use crate::config::{AppConfig, SlideKind};
-use crate::notch::anim::Spring;
+use crate::notch::anim::{smoothstep, Spring};
 
 /// Placeholder shown when the focus line has been cleared entirely.
 const EMPTY_FOCUS: &str = "What are you working on?";
@@ -192,13 +192,27 @@ impl NotchState {
 
         // The marquee only advances when it can be seen.
         let slides = cfg.notch.effective_slides();
-        let marquee_visible = slides
-            .get(self.active)
-            .map(|s| *s == SlideKind::Marquee)
-            .unwrap_or(false)
-            || (self.expand.value > 0.05 && slides.contains(&SlideKind::Marquee));
+        let expand = self.expand.value.clamp(0.0, 1.0);
+        let collapsed_alpha = 1.0 - smoothstep(0.02, 0.30, expand);
+        let expanded_alpha = smoothstep(0.42, 0.96, expand);
+        // Match the painter's visibility thresholds. Merely having a
+        // marquee somewhere in the deck must not animate a hidden slide.
+        let marquee_visible = (collapsed_alpha > 0.004
+            && slides
+                .get(self.active)
+                .map(|s| *s == SlideKind::Marquee)
+                .unwrap_or(false))
+            || (expanded_alpha > 0.004
+                && slides.iter().enumerate().any(|(i, slide)| {
+                    *slide == SlideKind::Marquee
+                        && expanded_alpha
+                            * (1.0 - (i as f32 - self.carousel.value).abs())
+                                .clamp(0.0, 1.0)
+                                .powf(1.4)
+                            > 0.006
+                }));
 
-        if marquee_visible {
+        if marquee_visible && cfg.marquee.scroll {
             let speed = if cfg.animation.reverse {
                 -cfg.animation.speed
             } else {
@@ -309,5 +323,80 @@ impl NotchState {
             self.caret_on = true;
             self.caret_clock = 0.0;
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn resting(cfg: &AppConfig, slide: SlideKind, expanded: bool) -> NotchState {
+        let mut state = NotchState::new(cfg);
+        state.active = cfg
+            .notch
+            .effective_slides()
+            .iter()
+            .position(|s| *s == slide)
+            .unwrap();
+        state.carousel.set(state.active as f32);
+        state.expand.set(if expanded { 1.0 } else { 0.0 });
+        state
+    }
+
+    #[test]
+    fn hidden_marquee_does_not_invalidate_a_resting_panel() {
+        let cfg = AppConfig::default();
+        for slide in cfg.notch.effective_slides().iter().copied() {
+            if slide == SlideKind::Marquee {
+                continue;
+            }
+            for expanded in [false, true] {
+                let mut state = resting(&cfg, slide, expanded);
+                // Multiple idle ticks must leave this part of FrameKey stable.
+                for _ in 0..120 {
+                    state.tick(&cfg, if expanded { 1.0 } else { 0.0 }, 0.032);
+                }
+                assert_eq!(state.marquee_offset, 0.0, "{slide:?}, expanded={expanded}");
+            }
+        }
+    }
+
+    #[test]
+    fn static_marquee_does_not_animate() {
+        let mut cfg = AppConfig::default();
+        cfg.marquee.scroll = false;
+        for expanded in [false, true] {
+            let mut state = resting(&cfg, SlideKind::Marquee, expanded);
+            state.tick(&cfg, if expanded { 1.0 } else { 0.0 }, 0.032);
+            assert_eq!(state.marquee_offset, 0.0);
+        }
+    }
+
+    #[test]
+    fn visible_marquee_keeps_scrolling_in_both_sizes() {
+        let cfg = AppConfig::default();
+        for expanded in [false, true] {
+            let mut state = resting(&cfg, SlideKind::Marquee, expanded);
+            state.tick(&cfg, if expanded { 1.0 } else { 0.0 }, 0.032);
+            assert!(state.marquee_offset > 0.0);
+        }
+    }
+
+    #[test]
+    fn marquee_scrolls_while_entering_the_carousel() {
+        let cfg = AppConfig::default();
+        let mut state = resting(&cfg, SlideKind::Marquee, true);
+        state.carousel.set(state.active as f32 - 0.5);
+        state.tick(&cfg, 1.0, 0.016);
+        assert!(state.marquee_offset > 0.0);
+    }
+
+    #[test]
+    fn reverse_scroll_is_preserved() {
+        let mut cfg = AppConfig::default();
+        cfg.animation.reverse = true;
+        let mut state = resting(&cfg, SlideKind::Marquee, false);
+        state.tick(&cfg, 0.0, 0.032);
+        assert!(state.marquee_offset < 0.0);
     }
 }

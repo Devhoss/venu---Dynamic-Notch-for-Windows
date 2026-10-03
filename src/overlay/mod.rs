@@ -44,6 +44,7 @@ pub struct OverlayManager {
     windows: HashMap<Edge, Win32OverlayWindow>,
     layout: Option<LayoutKey>,
     laid_out_at: Instant,
+    last_render: Option<AppConfig>,
 }
 
 impl OverlayManager {
@@ -52,6 +53,7 @@ impl OverlayManager {
             windows: HashMap::new(),
             layout: None,
             laid_out_at: Instant::now(),
+            last_render: None,
         }
     }
 
@@ -92,26 +94,34 @@ impl OverlayManager {
     }
 
     /// Render one frame of every strip that is up. Returns whether any of them
-    /// are: the strips scroll continuously, so while one is on screen the
-    /// overlay thread has to keep running at full rate — but when none are,
-    /// this costs nothing.
+    /// are moving. A zero scroll speed leaves a static strip, which only
+    /// needs repainting on change or the layout heartbeat.
     pub fn render_tick(&mut self, config: &AppConfig, dt: f32) -> bool {
         // Laying the strips out means `SetWindowLongW` and `SetWindowPos` per
         // strip. Neither the settings nor the screen resolution change between
         // frames, so this runs on change and on a slow heartbeat instead.
         let layout = LayoutKey::of(config);
-        if self.layout != Some(layout) || self.laid_out_at.elapsed() >= RELAYOUT_INTERVAL {
+        let relayout =
+            self.layout != Some(layout) || self.laid_out_at.elapsed() >= RELAYOUT_INTERVAL;
+        if relayout {
             self.sync_windows(config);
             self.layout = Some(layout);
             self.laid_out_at = Instant::now();
         }
 
-        for (edge, win) in self.windows.iter_mut() {
-            if let Err(e) = win.update_and_render(config, dt) {
-                eprintln!("[OverlayManager] Render error for {:?}: {:?}", edge, e);
+        let moving = config.animation.speed != 0.0;
+        let changed = self.last_render.as_ref() != Some(config);
+        if moving || changed || relayout {
+            for (edge, win) in self.windows.iter_mut() {
+                if let Err(e) = win.update_and_render(config, dt) {
+                    eprintln!("[OverlayManager] Render error for {:?}: {:?}", edge, e);
+                }
+            }
+            if changed {
+                self.last_render = Some(config.clone());
             }
         }
 
-        !self.windows.is_empty()
+        moving && !self.windows.is_empty()
     }
 }

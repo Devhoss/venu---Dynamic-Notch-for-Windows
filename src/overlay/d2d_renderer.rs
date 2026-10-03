@@ -19,7 +19,7 @@ use windows::Win32::Graphics::Gdi::{
     BITMAPINFOHEADER, BI_RGB, DIB_RGB_COLORS, HBITMAP, HDC,
 };
 
-use crate::config::AppConfig;
+use crate::config::{AppConfig, FontConfig};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Edge {
@@ -27,6 +27,18 @@ pub enum Edge {
     Bottom,
     Left,
     Right,
+}
+
+/// Text shaping depends on content and layout, never on scroll position.
+struct CachedText {
+    text: String,
+    font: FontConfig,
+    phrase_spacing: u32,
+    width: u32,
+    height: u32,
+    edge: Edge,
+    layout: IDWriteTextLayout,
+    single_width: f32,
 }
 
 pub struct D2DRenderer {
@@ -39,6 +51,7 @@ pub struct D2DRenderer {
     bits: *mut std::ffi::c_void,
     width: u32,
     height: u32,
+    text: Option<CachedText>,
 }
 
 unsafe impl Send for D2DRenderer {}
@@ -61,6 +74,7 @@ impl D2DRenderer {
             bits: std::ptr::null_mut(),
             width: 0,
             height: 0,
+            text: None,
         })
     }
 
@@ -153,38 +167,26 @@ impl D2DRenderer {
         }
     }
 
-    pub fn render_frame(
+    fn text_layout(
         &mut self,
         width: u32,
         height: u32,
         config: &AppConfig,
-        offset: f32,
         edge: Edge,
-    ) -> windows::core::Result<Option<HDC>> {
-        if width == 0 || height == 0 {
-            return Ok(None);
+    ) -> windows::core::Result<(IDWriteTextLayout, f32)> {
+        if let Some(cached) = &self.text {
+            if cached.text == config.text
+                && cached.font == config.font
+                && cached.phrase_spacing == config.phrase_spacing
+                && cached.width == width
+                && cached.height == height
+                && cached.edge == edge
+            {
+                return Ok((cached.layout.clone(), cached.single_width));
+            }
         }
 
-        self.ensure_buffer(width, height)?;
-
-        let dc_target = match self.dc_target.as_ref() {
-            Some(target) => target,
-            None => return Ok(None),
-        };
-
         unsafe {
-            dc_target.BeginDraw();
-
-            // Background color (premultiplied alpha)
-            let bg = config.colors.bg_color;
-            let bg_color = D2D1_COLOR_F {
-                r: bg[0] * bg[3],
-                g: bg[1] * bg[3],
-                b: bg[2] * bg[3],
-                a: bg[3],
-            };
-            dc_target.Clear(Some(&bg_color));
-
             // Font setup
             let weight = if config.font.bold {
                 DWRITE_FONT_WEIGHT_BOLD
@@ -242,7 +244,7 @@ impl D2DRenderer {
             };
 
             // Dynamically calculate repetitions so full_text always fills screen extent + extra buffer
-            let repeat_count = ((screen_extent / single_width).ceil() as usize + 10).max(50);
+            let repeat_count = ((screen_extent / single_width).ceil() as usize + 2).max(2);
 
             let mut full_text =
                 String::with_capacity(single_phrase_with_spacing.len() * repeat_count);
@@ -266,6 +268,54 @@ impl D2DRenderer {
                 max_layout_w,
                 max_layout_h,
             )?;
+
+            self.text = Some(CachedText {
+                text: config.text.clone(),
+                font: config.font.clone(),
+                phrase_spacing: config.phrase_spacing,
+                width,
+                height,
+                edge,
+                layout: text_layout.clone(),
+                single_width,
+            });
+            Ok((text_layout, single_width))
+        }
+    }
+
+    pub fn render_frame(
+        &mut self,
+        width: u32,
+        height: u32,
+        config: &AppConfig,
+        offset: f32,
+        edge: Edge,
+    ) -> windows::core::Result<Option<HDC>> {
+        if width == 0 || height == 0 {
+            return Ok(None);
+        }
+
+        self.ensure_buffer(width, height)?;
+        let (text_layout, single_width) = self.text_layout(width, height, config, edge)?;
+        let is_vertical = matches!(edge, Edge::Left | Edge::Right);
+
+        let dc_target = match self.dc_target.as_ref() {
+            Some(target) => target,
+            None => return Ok(None),
+        };
+
+        unsafe {
+            dc_target.BeginDraw();
+
+            // Background color (premultiplied alpha)
+            let bg = config.colors.bg_color;
+            let bg_color = D2D1_COLOR_F {
+                r: bg[0] * bg[3],
+                g: bg[1] * bg[3],
+                b: bg[2] * bg[3],
+                a: bg[3],
+            };
+            dc_target.Clear(Some(&bg_color));
 
             // Text Brush (premultiplied alpha)
             let fg = config.colors.text_color;
