@@ -291,6 +291,9 @@ struct FrameKey {
     media: u64,
     /// Bumped by the notification centre on every change to it.
     notifications: u64,
+    /// Sample revision only while the Stats slide is active, so system
+    /// telemetry does not create background work for unrelated slides.
+    stats: u64,
 }
 
 /// What one frame of the notch asked for.
@@ -761,7 +764,7 @@ impl NotchWindow {
         // atomics. The paint below is not, so it is only spent when the frame
         // would come out different — or when the last one it drew said it was
         // still moving under its own clock.
-        let key = self.frame_key(shape);
+        let key = self.frame_key(shape, cfg);
         let changed = self.last_key.as_ref() != Some(&key) || self.last_cfg.as_ref() != Some(cfg);
 
         let since_paint = self.last_paint.elapsed();
@@ -800,7 +803,14 @@ impl NotchWindow {
 
     /// Snapshot of everything that would change what the next frame looks
     /// like. See [`FrameKey`].
-    fn frame_key(&self, shape: NotchShape) -> FrameKey {
+    fn frame_key(&self, shape: NotchShape, cfg: &AppConfig) -> FrameKey {
+        let active_slide = cfg.notch.effective_slides().get(self.state.active).copied();
+        let stats_revision = if active_slide == Some(SlideKind::Stats) {
+            crate::stats::snapshot().revision
+        } else {
+            0
+        };
+
         FrameKey {
             placement: self.placement,
             shape,
@@ -821,6 +831,7 @@ impl NotchWindow {
             clock: clock_key(),
             media: self.painter.media.revision(),
             notifications: crate::notch::notify::global_store().read().revision(),
+            stats: stats_revision,
         }
     }
 
