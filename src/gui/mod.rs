@@ -246,6 +246,12 @@ const PAGES: &[Page] = &[
     },
     Page {
         group: Group::App,
+        title: "Stats",
+        blurb: "Live system health at a glance: processor, memory, GPU activity and power state.",
+        draw: SettingsApp::page_app_stats,
+    },
+    Page {
+        group: Group::App,
         title: "Preferences",
         blurb: "The settings window itself, and where your settings are kept.",
         draw: SettingsApp::page_app_prefs,
@@ -597,6 +603,130 @@ impl SettingsApp {
         Self::sec_flash_anim(ui, cx.cfg, cx.changed);
         Self::divider(ui);
         Self::sec_flash_behavior(ui, cx.cfg, cx.changed);
+    }
+
+    fn page_app_stats(ui: &mut egui::Ui, _cx: &mut PageCtx<'_>) {
+        ui.ctx()
+            .request_repaint_after(std::time::Duration::from_secs(1));
+
+        let stats = crate::stats::snapshot();
+        Self::section_title(ui, "SYSTEM HEALTH");
+
+        let cpu = stats
+            .cpu_pct
+            .map(|v| format!("{v:.0}%"))
+            .unwrap_or_else(|| "—".to_string());
+        let ram = stats
+            .ram_pct
+            .map(|v| format!("{v:.0}%"))
+            .unwrap_or_else(|| "—".to_string());
+        let gpu = stats
+            .gpu_pct
+            .map(|v| format!("{v:.0}%"))
+            .unwrap_or_else(|| "—".to_string());
+        let power = match (stats.battery_pct, stats.ac_online) {
+            (Some(pct), _) if stats.charging => format!("{pct}%"),
+            (Some(pct), _) => format!("{pct}%"),
+            (None, Some(true)) => "AC".to_string(),
+            (None, Some(false)) => "BAT".to_string(),
+            _ => "—".to_string(),
+        };
+
+        let power_hint = match (stats.battery_pct, stats.ac_online, stats.charging) {
+            (Some(_), _, true) => "Charging",
+            (Some(_), Some(true), false) => "Plugged in",
+            (Some(_), Some(false), false) => "On battery",
+            (None, Some(true), _) => "AC power",
+            (None, Some(false), _) => "Battery power",
+            _ => "Unavailable",
+        };
+
+        let ram_hint = if stats.ram_total > 0 {
+            format!(
+                "{} used of {}",
+                crate::stats::format_bytes(stats.ram_used),
+                crate::stats::format_bytes(stats.ram_total)
+            )
+        } else {
+            "Physical memory".to_string()
+        };
+
+        ui.columns(4, |cols| {
+            let cards = [
+                ("CPU", cpu.as_str(), "Processor"),
+                ("RAM", ram.as_str(), ram_hint.as_str()),
+                ("GPU", gpu.as_str(), "Busiest engine"),
+                ("POWER", power.as_str(), power_hint),
+            ];
+
+            for (ui, (label, value, hint)) in cols.iter_mut().zip(cards) {
+                Frame::none()
+                    .fill(theme::surface())
+                    .stroke(Stroke::new(1.0, theme::divider()))
+                    .rounding(Rounding::same(10.0))
+                    .inner_margin(Margin::same(14.0))
+                    .show(ui, |ui| {
+                        ui.set_min_height(86.0);
+                        ui.label(
+                            RichText::new(label)
+                                .size(10.0)
+                                .strong()
+                                .color(theme::text_tertiary()),
+                        );
+                        ui.add_space(6.0);
+                        ui.label(
+                            RichText::new(value)
+                                .size(25.0)
+                                .strong()
+                                .color(theme::text_primary()),
+                        );
+                        ui.add_space(3.0);
+                        ui.label(
+                            RichText::new(hint)
+                                .size(10.5)
+                                .color(theme::text_secondary()),
+                        );
+                    });
+            }
+        });
+
+        ui.add_space(18.0);
+        Self::section_title(ui, "LIVE MONITOR");
+
+        let rows = [
+            ("CPU utilization", stats.cpu_pct, "Total processor load"),
+            ("Memory pressure", stats.ram_pct, "Physical RAM in use"),
+            ("GPU activity", stats.gpu_pct, "Highest active GPU engine"),
+        ];
+
+        for (label, value, hint) in rows {
+            Self::row_stacked(ui, label, Some(hint), |ui| {
+                let pct = value.unwrap_or(0.0).clamp(0.0, 100.0);
+                ui.horizontal(|ui| {
+                    ui.add(
+                        egui::ProgressBar::new(pct / 100.0)
+                            .desired_width(190.0)
+                            .show_percentage(),
+                    );
+                    if value.is_none() {
+                        ui.label(
+                            RichText::new("Unavailable")
+                                .size(10.5)
+                                .color(theme::text_tertiary()),
+                        );
+                    }
+                });
+            });
+        }
+
+        ui.add_space(4.0);
+        ui.label(
+            RichText::new(
+                "Updated about once per second. GPU uses Windows performance counters and may be unavailable on some drivers or remote sessions.",
+            )
+            .size(10.5)
+            .color(theme::text_tertiary()),
+        );
     }
 
     fn page_app_prefs(ui: &mut egui::Ui, cx: &mut PageCtx<'_>) {
@@ -3195,6 +3325,29 @@ fn paint_sidebar_hugeicon(
             for i in 0..pts.len() {
                 painter.line_segment([pts[i], pts[(i + 1) % pts.len()]], stroke);
             }
+        }
+        (Group::App, "Stats") => {
+            // Hugeicons: Analytics bars
+            painter.line_segment(
+                [egui::pos2(cx - 5.2, cy + 4.8), egui::pos2(cx - 5.2, cy + 0.5)],
+                stroke,
+            );
+            painter.line_segment(
+                [egui::pos2(cx - 1.7, cy + 4.8), egui::pos2(cx - 1.7, cy - 3.0)],
+                stroke,
+            );
+            painter.line_segment(
+                [egui::pos2(cx + 1.8, cy + 4.8), egui::pos2(cx + 1.8, cy - 0.8)],
+                stroke,
+            );
+            painter.line_segment(
+                [egui::pos2(cx + 5.2, cy + 4.8), egui::pos2(cx + 5.2, cy - 5.0)],
+                stroke,
+            );
+            painter.line_segment(
+                [egui::pos2(cx - 6.2, cy + 4.8), egui::pos2(cx + 6.2, cy + 4.8)],
+                stroke,
+            );
         }
         (Group::App, "Preferences") => {
             // Hugeicons: Settings Gear
