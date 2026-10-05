@@ -1453,6 +1453,40 @@ impl Painter {
                     theme::fade(self.pal.text_hi, alpha),
                 );
             }
+            SlideKind::Stats => {
+                let stats = crate::stats::snapshot();
+                let fmt = |value: Option<f32>| {
+                    value
+                        .map(|v| format!("{:.0}", v))
+                        .unwrap_or_else(|| "—".to_string())
+                };
+                let text = format!(
+                    "CPU {}%  ·  RAM {}%  ·  GPU {}%",
+                    fmt(stats.cpu_pct),
+                    fmt(stats.ram_pct),
+                    fmt(stats.gpu_pct)
+                );
+
+                let Ok(format) =
+                    self.text
+                        .format(family, theme::SIZE_PILL - 1.0, DWRITE_FONT_WEIGHT_SEMI_BOLD)
+                else {
+                    return;
+                };
+                self.text.set_ellipsis(&format);
+                let avail = (shape.right - shape.left - pad * 2.0).max(10.0);
+                let Ok(layout) = self.text.layout(&text, &format, avail, shape.height()) else {
+                    return;
+                };
+                let (_, th) = TextEngine::measure(&layout);
+                self.draw_layout(
+                    t,
+                    &layout,
+                    shape.left + pad,
+                    cy - th * 0.5,
+                    theme::fade(self.pal.text_hi, alpha),
+                );
+            }
         }
     }
 
@@ -1543,6 +1577,7 @@ impl Painter {
             SlideKind::Media => self.paint_media(t, factory, cfg, body, alpha, generation),
             SlideKind::Notifications => self.paint_notifications(t, cfg, state, body, alpha),
             SlideKind::Usage => self.paint_usage(t, cfg, body, alpha),
+            SlideKind::Stats => self.paint_stats(t, cfg, body, alpha),
         }
     }
 
@@ -1669,6 +1704,118 @@ impl Painter {
             self.fill_rrect(t, filled, 2.0, theme::fade(fill_color, alpha));
 
             y += row_h;
+        }
+    }
+
+    fn paint_stats(
+        &mut self,
+        t: &ID2D1DCRenderTarget,
+        cfg: &AppConfig,
+        body: D2D_RECT_F,
+        alpha: f32,
+    ) {
+        let family = &cfg.notch.font_family;
+        let stats = crate::stats::snapshot();
+
+        self.label(
+            t,
+            family,
+            "SYSTEM STATS",
+            theme::SIZE_LABEL,
+            DWRITE_FONT_WEIGHT_EXTRA_BOLD,
+            theme::TRACK_LABEL,
+            body.right - body.left,
+            body.left,
+            body.top,
+            theme::fade(self.pal.text_lo, alpha * 0.9),
+        );
+
+        let power = match (stats.battery_pct, stats.ac_online, stats.charging) {
+            (Some(pct), _, true) => format!("{pct}%  CHARGING"),
+            (Some(pct), Some(true), false) => format!("{pct}%  AC"),
+            (Some(pct), Some(false), false) => format!("{pct}%  BATTERY"),
+            (None, Some(true), _) => "AC POWER".to_string(),
+            (None, Some(false), _) => "BATTERY".to_string(),
+            _ => "POWER —".to_string(),
+        };
+        self.label(
+            t,
+            family,
+            &power,
+            theme::SIZE_LABEL - 1.0,
+            DWRITE_FONT_WEIGHT_BOLD,
+            theme::TRACK_LABEL * 0.4,
+            150.0,
+            body.right - 150.0,
+            body.top + 1.0,
+            theme::fade(cfg.notch.accent, alpha * 0.95),
+        );
+
+        let metrics = [
+            ("CPU", stats.cpu_pct),
+            ("RAM", stats.ram_pct),
+            ("GPU", stats.gpu_pct),
+        ];
+        let gap = 10.0;
+        let total_w = body.right - body.left;
+        let card_w = (total_w - gap * 2.0) / 3.0;
+        let card_top = body.top + 30.0;
+        let card_bottom = body.bottom - 2.0;
+
+        for (i, (name, value)) in metrics.into_iter().enumerate() {
+            let left = body.left + i as f32 * (card_w + gap);
+            let rect = D2D_RECT_F {
+                left,
+                top: card_top,
+                right: left + card_w,
+                bottom: card_bottom,
+            };
+            self.fill_rrect(t, rect, 9.0, theme::fade(self.pal.well, alpha * 0.9));
+            self.stroke_rrect(t, rect, 9.0, 1.0, theme::fade(self.pal.rule, alpha * 0.7));
+
+            self.label(
+                t,
+                family,
+                name,
+                theme::SIZE_LABEL - 1.0,
+                DWRITE_FONT_WEIGHT_EXTRA_BOLD,
+                theme::TRACK_LABEL,
+                card_w - 20.0,
+                rect.left + 10.0,
+                rect.top + 9.0,
+                theme::fade(self.pal.text_lo, alpha),
+            );
+
+            let value_text = value
+                .map(|v| format!("{:.0}%", v.clamp(0.0, 100.0)))
+                .unwrap_or_else(|| "—".to_string());
+            self.label(
+                t,
+                family,
+                &value_text,
+                theme::SIZE_LEAD + 5.0,
+                DWRITE_FONT_WEIGHT_BOLD,
+                0.0,
+                card_w - 20.0,
+                rect.left + 10.0,
+                rect.top + 29.0,
+                theme::fade(self.pal.text_hi, alpha),
+            );
+
+            if let Some(pct) = value {
+                let track = D2D_RECT_F {
+                    left: rect.left + 10.0,
+                    top: rect.bottom - 17.0,
+                    right: rect.right - 10.0,
+                    bottom: rect.bottom - 12.0,
+                };
+                self.fill_rrect(t, track, 2.5, theme::fade(self.pal.rule, alpha * 0.9));
+                let fill = D2D_RECT_F {
+                    right: track.left + (track.right - track.left) * (pct / 100.0).clamp(0.0, 1.0),
+                    ..track
+                };
+                self.fill_rrect(t, fill, 2.5, theme::fade(cfg.notch.accent, alpha));
+            }
         }
     }
 

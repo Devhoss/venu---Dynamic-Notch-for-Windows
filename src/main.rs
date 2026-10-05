@@ -4,6 +4,7 @@ mod flash;
 mod gui;
 mod notch;
 mod overlay;
+mod stats;
 mod tray;
 
 use parking_lot::RwLock;

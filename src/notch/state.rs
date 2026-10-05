@@ -115,6 +115,7 @@ impl NotchState {
             CollapsedMode::Media => SlideKind::Media,
             CollapsedMode::Notifications => SlideKind::Notifications,
             CollapsedMode::Usage => SlideKind::Usage,
+            CollapsedMode::Stats => SlideKind::Stats,
             CollapsedMode::Auto => {
                 if unread_notifs && slides.contains(&SlideKind::Notifications) {
                     SlideKind::Notifications
