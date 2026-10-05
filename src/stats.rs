@@ -13,8 +13,7 @@ use windows::core::PCSTR;
 use windows::Win32::Foundation::FILETIME;
 use windows::Win32::System::Performance::{
     PdhAddEnglishCounterA, PdhCloseQuery, PdhCollectQueryData, PdhGetFormattedCounterArrayA,
-    PdhOpenQueryA, PDH_FMT_COUNTERVALUE_ITEM_A, PDH_FMT_DOUBLE, PDH_HCOUNTER, PDH_HQUERY,
-    PDH_MORE_DATA,
+    PdhOpenQueryA, PDH_FMT_COUNTERVALUE_ITEM_A, PDH_FMT_DOUBLE, PDH_MORE_DATA,
 };
 use windows::Win32::System::Power::{GetSystemPowerStatus, SYSTEM_POWER_STATUS};
 use windows::Win32::System::SystemInformation::{GlobalMemoryStatusEx, MEMORYSTATUSEX};
@@ -37,25 +36,21 @@ pub struct StatsSnapshot {
 }
 
 struct GpuQuery {
-    query: usize,
-    counter: usize,
+    // windows 0.58 exposes PDH handles as isize, not named handle wrappers.
+    query: isize,
+    counter: isize,
 }
 
 impl GpuQuery {
     fn new() -> Option<Self> {
         unsafe {
-            let mut query = PDH_HQUERY::default();
+            let mut query = 0isize;
             if PdhOpenQueryA(PCSTR::null(), 0, &mut query) != 0 {
                 return None;
             }
 
-            let mut counter = PDH_HCOUNTER::default();
-            let status = PdhAddEnglishCounterA(
-                query,
-                PCSTR(GPU_COUNTER.as_ptr()),
-                0,
-                &mut counter,
-            );
+            let mut counter = 0isize;
+            let status = PdhAddEnglishCounterA(query, PCSTR(GPU_COUNTER.as_ptr()), 0, &mut counter);
             if status != 0 {
                 let _ = PdhCloseQuery(query);
                 return None;
@@ -64,30 +59,22 @@ impl GpuQuery {
             // Percentage counters need two samples. Prime the query now; the
             // next one-second Stats refresh can return a real value.
             let _ = PdhCollectQueryData(query);
-            Some(Self {
-                query: query.0 as usize,
-                counter: counter.0 as usize,
-            })
+            Some(Self { query, counter })
         }
     }
 
     fn sample(&mut self) -> Option<f32> {
         unsafe {
-            let query = PDH_HQUERY(self.query as *mut _);
-            let counter = PDH_HCOUNTER(self.counter as *mut _);
+            let query = self.query;
+            let counter = self.counter;
             if PdhCollectQueryData(query) != 0 {
                 return None;
             }
 
             let mut bytes = 0u32;
             let mut count = 0u32;
-            let first = PdhGetFormattedCounterArrayA(
-                counter,
-                PDH_FMT_DOUBLE,
-                &mut bytes,
-                &mut count,
-                None,
-            );
+            let first =
+                PdhGetFormattedCounterArrayA(counter, PDH_FMT_DOUBLE, &mut bytes, &mut count, None);
             if first != PDH_MORE_DATA || bytes == 0 || count == 0 {
                 return None;
             }
@@ -95,8 +82,8 @@ impl GpuQuery {
             // PDH writes the item array plus its strings into one caller-owned
             // byte buffer. usize gives the allocation pointer enough alignment
             // for PDH_FMT_COUNTERVALUE_ITEM_A.
-            let words = (bytes as usize + std::mem::size_of::<usize>() - 1)
-                / std::mem::size_of::<usize>();
+            let words =
+                (bytes as usize + std::mem::size_of::<usize>() - 1) / std::mem::size_of::<usize>();
             let mut buffer = vec![0usize; words];
             let items = buffer.as_mut_ptr() as *mut PDH_FMT_COUNTERVALUE_ITEM_A;
             let status = PdhGetFormattedCounterArrayA(
@@ -133,7 +120,7 @@ impl GpuQuery {
 impl Drop for GpuQuery {
     fn drop(&mut self) {
         unsafe {
-            let _ = PdhCloseQuery(PDH_HQUERY(self.query as *mut _));
+            let _ = PdhCloseQuery(self.query);
         }
     }
 }
@@ -252,7 +239,9 @@ fn filetime_ticks(value: FILETIME) -> u64 {
 static SAMPLER: OnceLock<Mutex<Sampler>> = OnceLock::new();
 
 pub fn snapshot() -> StatsSnapshot {
-    let mut sampler = SAMPLER.get_or_init(|| Mutex::new(Sampler::default())).lock();
+    let mut sampler = SAMPLER
+        .get_or_init(|| Mutex::new(Sampler::default()))
+        .lock();
     sampler.refresh_if_due();
     sampler.snapshot.clone()
 }

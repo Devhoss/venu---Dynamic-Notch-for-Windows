@@ -3329,23 +3329,38 @@ fn paint_sidebar_hugeicon(
         (Group::App, "Stats") => {
             // Hugeicons: Analytics bars
             painter.line_segment(
-                [egui::pos2(cx - 5.2, cy + 4.8), egui::pos2(cx - 5.2, cy + 0.5)],
+                [
+                    egui::pos2(cx - 5.2, cy + 4.8),
+                    egui::pos2(cx - 5.2, cy + 0.5),
+                ],
                 stroke,
             );
             painter.line_segment(
-                [egui::pos2(cx - 1.7, cy + 4.8), egui::pos2(cx - 1.7, cy - 3.0)],
+                [
+                    egui::pos2(cx - 1.7, cy + 4.8),
+                    egui::pos2(cx - 1.7, cy - 3.0),
+                ],
                 stroke,
             );
             painter.line_segment(
-                [egui::pos2(cx + 1.8, cy + 4.8), egui::pos2(cx + 1.8, cy - 0.8)],
+                [
+                    egui::pos2(cx + 1.8, cy + 4.8),
+                    egui::pos2(cx + 1.8, cy - 0.8),
+                ],
                 stroke,
             );
             painter.line_segment(
-                [egui::pos2(cx + 5.2, cy + 4.8), egui::pos2(cx + 5.2, cy - 5.0)],
+                [
+                    egui::pos2(cx + 5.2, cy + 4.8),
+                    egui::pos2(cx + 5.2, cy - 5.0),
+                ],
                 stroke,
             );
             painter.line_segment(
-                [egui::pos2(cx - 6.2, cy + 4.8), egui::pos2(cx + 6.2, cy + 4.8)],
+                [
+                    egui::pos2(cx - 6.2, cy + 4.8),
+                    egui::pos2(cx + 6.2, cy + 4.8),
+                ],
                 stroke,
             );
         }
