@@ -1,6 +1,6 @@
 [package]
 name = "venu"
-version = "0.4.1"
+version = "0.4.2"
 edition = "2021"
 description = "A sleek, hardware-accelerated Dynamic Notch for Windows with live background blur, media controls, multi-glass finishes, and desktop notifications."
 license = "MIT"
@@ -63,6 +63,8 @@ features = [
     "Win32_System_Console",
     "Win32_System_Diagnostics_Debug",
     "Win32_System_LibraryLoader",
+    "Win32_System_Performance",
+    "Win32_System_Power",
     "Win32_System_SystemInformation",
     "Win32_System_Registry",
     "Win32_System_Threading",

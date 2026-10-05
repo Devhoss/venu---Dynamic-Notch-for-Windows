@@ -22,5 +22,8 @@ jobs:
       - name: Build
         run: cargo build --locked
 
+      - name: Test
+        run: cargo test --locked
+
       - name: Check formatting
         run: cargo fmt --check

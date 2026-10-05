@@ -188,10 +188,12 @@ pub enum SlideKind {
     Notifications,
     /// Claude Code usage: context window, session cost, and rate limits.
     Usage,
+    /// Live Windows system resource usage and power state.
+    Stats,
 }
 
 impl SlideKind {
-    pub const ALL: [SlideKind; 7] = [
+    pub const ALL: [SlideKind; 8] = [
         SlideKind::Status,
         SlideKind::Clock,
         SlideKind::Marquee,
@@ -199,6 +201,7 @@ impl SlideKind {
         SlideKind::Media,
         SlideKind::Notifications,
         SlideKind::Usage,
+        SlideKind::Stats,
     ];
 
     pub fn label(self) -> &'static str {
@@ -210,6 +213,7 @@ impl SlideKind {
             SlideKind::Media => "Now Playing",
             SlideKind::Notifications => "Notifications",
             SlideKind::Usage => "Claude Usage",
+            SlideKind::Stats => "Stats",
         }
     }
 }
@@ -234,12 +238,14 @@ pub enum CollapsedMode {
     Notifications,
     /// Resets to Claude Code usage slide.
     Usage,
+    /// Resets to system stats slide.
+    Stats,
     /// Smart / Auto mode: shows active alerts if unread, or Now Playing if music is on, otherwise Clock.
     Auto,
 }
 
 impl CollapsedMode {
-    pub const ALL: [CollapsedMode; 9] = [
+    pub const ALL: [CollapsedMode; 10] = [
         CollapsedMode::LastActive,
         CollapsedMode::Status,
         CollapsedMode::Clock,
@@ -248,6 +254,7 @@ impl CollapsedMode {
         CollapsedMode::Media,
         CollapsedMode::Notifications,
         CollapsedMode::Usage,
+        CollapsedMode::Stats,
         CollapsedMode::Auto,
     ];
 
@@ -261,6 +268,7 @@ impl CollapsedMode {
             CollapsedMode::Media => "Now Playing",
             CollapsedMode::Notifications => "Notifications",
             CollapsedMode::Usage => "Claude Usage",
+            CollapsedMode::Stats => "Stats",
             CollapsedMode::Auto => "Dynamic / Auto",
         }
     }

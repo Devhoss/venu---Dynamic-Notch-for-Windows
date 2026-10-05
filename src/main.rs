@@ -4,11 +4,12 @@ mod flash;
 mod gui;
 mod notch;
 mod overlay;
+mod stats;
 mod tray;
 
 use parking_lot::RwLock;
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use windows::core::{HSTRING, PCWSTR};
 use windows::Win32::Foundation::{GetLastError, ERROR_ALREADY_EXISTS};
 use windows::Win32::System::Console::FreeConsole;
@@ -159,6 +160,7 @@ fn main() {
         let mut notch = NotchManager::new(Arc::clone(&overlay_config));
         let mut flash = FlashManager::new();
         let mut last_instant = Instant::now();
+        let mut next_tick = last_instant;
 
         loop {
             // Process Win32 Message Queue for layered windows & System Tray
@@ -179,6 +181,16 @@ fn main() {
             }
 
             let now = Instant::now();
+            // Input wakes the message pump, not the renderer. Rendering on
+            // every wake lets mouse traffic (or our own window messages) run
+            // the animation faster than the intended frame rate.
+            if now < next_tick {
+                let wait = (next_tick - now).as_millis() as u32 + 1;
+                unsafe {
+                    MsgWaitForMultipleObjectsEx(None, wait, QS_ALLINPUT, MWMO_INPUTAVAILABLE);
+                }
+                continue;
+            }
             let dt = now.duration_since(last_instant).as_secs_f32();
             last_instant = now;
 
@@ -195,19 +207,8 @@ fn main() {
             // Takes its own lock: inline editing writes back into the config.
             animating |= notch.tick(dt);
 
-            // Wait for the next frame *or* the next input message, whichever
-            // comes first. A plain sleep here would hold mouse messages for up
-            // to a frame before answering them — and since the notch window
-            // covers a wide strip along the top of the screen, that shows up as
-            // a cursor that drags whenever it crosses that strip.
-            unsafe {
-                let budget = if animating { FRAME_MS } else { IDLE_POLL_MS };
-                let elapsed = last_instant.elapsed().as_millis() as u32;
-                let wait = budget.saturating_sub(elapsed);
-                if wait > 0 {
-                    MsgWaitForMultipleObjectsEx(None, wait, QS_ALLINPUT, MWMO_INPUTAVAILABLE);
-                }
-            }
+            let budget = if animating { FRAME_MS } else { IDLE_POLL_MS };
+            next_tick = now + Duration::from_millis(budget as u64);
         }
     });
 
