@@ -109,6 +109,20 @@ impl NotchManager {
             window.tick(&mut cfg, dt)
         };
 
+        // Raising the Settings window happens here, with the lock released.
+        //
+        // `window.tick` runs while this thread holds the config write lock, and
+        // the foreground calls in `tray::restore_settings_window` are
+        // synchronous: they make the Settings window's thread service a message
+        // before returning. That thread takes the same config write lock at the
+        // top of its own update, so calling them under the lock closed a cycle
+        // -- the overlay thread waiting on the Settings thread, the Settings
+        // thread waiting on the lock the overlay thread held -- and the window
+        // hung as "Not Responding" until the app was killed.
+        if outcome.open_settings {
+            crate::tray::restore_settings_window();
+        }
+
         if outcome.config_dirty {
             self.save_countdown = Some(SAVE_DEBOUNCE);
         }
