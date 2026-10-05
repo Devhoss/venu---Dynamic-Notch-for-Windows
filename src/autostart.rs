@@ -17,7 +17,8 @@ use std::path::{Path, PathBuf};
 use windows::core::{HSTRING, PCWSTR};
 use windows::Win32::Foundation::{ERROR_FILE_NOT_FOUND, ERROR_SUCCESS};
 use windows::Win32::System::Registry::{
-    RegCloseKey, RegDeleteValueW, RegOpenKeyExW, RegQueryValueExW, RegSetValueExW, HKEY,
+    RegCloseKey, RegCreateKeyW, RegDeleteValueW, RegOpenKeyExW, RegQueryValueExW, RegSetValueExW,
+    HKEY,
     HKEY_CURRENT_USER, KEY_QUERY_VALUE, KEY_SET_VALUE, REG_SAM_FLAGS, REG_SZ,
 };
 
@@ -69,7 +70,18 @@ fn with_key<T>(
 }
 
 fn set_value(value_name: &str, data: &str) -> RegResult<()> {
-    with_key(RUN_KEY_PATH, KEY_SET_VALUE, |key| unsafe {
+    // A clean Windows profile (including GitHub Actions runners) may not have
+    // the standard Run key yet. Create/open it for writes instead of assuming
+    // Explorer has already created it. RegCreateKeyW is idempotent for an
+    // existing key and gives us the write access needed for RegSetValueExW.
+    unsafe {
+        let mut key = HKEY::default();
+        let sub = HSTRING::from(RUN_KEY_PATH);
+        let err = RegCreateKeyW(HKEY_CURRENT_USER, PCWSTR(sub.as_ptr()), &mut key);
+        if err != ERROR_SUCCESS {
+            return Err(err.0);
+        }
+
         let name = HSTRING::from(value_name);
         let mut wide: Vec<u16> = data.encode_utf16().collect();
         wide.push(0);
@@ -78,12 +90,13 @@ fn set_value(value_name: &str, data: &str) -> RegResult<()> {
             bytes.extend_from_slice(&unit.to_le_bytes());
         }
         let err = RegSetValueExW(key, PCWSTR(name.as_ptr()), 0, REG_SZ, Some(&bytes));
+        let _ = RegCloseKey(key);
         if err == ERROR_SUCCESS {
             Ok(())
         } else {
             Err(err.0)
         }
-    })
+    }
 }
 
 fn value_exists(value_name: &str) -> RegResult<bool> {
